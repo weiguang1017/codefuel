@@ -25,6 +25,9 @@ tests/.tmp/
 tests/tmpapp/
 checkin_screenshots/
 
+# 本机工作记忆，不进版本库
+.workbuddy/
+
 # 系统与编辑器
 .DS_Store
 .idea/
