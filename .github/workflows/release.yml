@@ -143,16 +143,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          echo "下载到的工作目录："
+          find artifacts -maxdepth 2 -type f -printf '%s\t%p\n' | sort -k2
           mkdir -p release
-          find artifacts -maxdepth 1 -mindepth 1 -type d \
-            \( -name 'macos-installer' -o -name 'windows-installer' \) -print0 \
-            | xargs -0 -I{} cp -R {}/* release/ 2>/dev/null || true
-          # Windows 便携目录单独压成 zip，避免 Release 里出现散落的上千个文件。
-          if [ -d release/CodeFuel ]; then
-            (cd release && zip -qr "CodeFuel-Windows-portable-$(echo "${GITHUB_REF_NAME}" | sed 's/^v//').zip" CodeFuel)
-            rm -rf release/CodeFuel
+          # 按文件类型收拢，不用通配符 cp，避免静默失败。
+          find artifacts -type f \( -name '*.dmg' -o -name '*.zip' -o -name '*.exe' \) \
+            -exec cp -v {} release/ \;
+          # Windows 便携目录单独压成 zip，避免 Release 里出现上千个散文件。
+          if [ -d artifacts/windows-installer/CodeFuel ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+            (cd artifacts/windows-installer && zip -qr "$GITHUB_WORKSPACE/release/CodeFuel-Windows-portable-${VERSION}.zip" CodeFuel)
           fi
+          echo "待上传："
           ls -lh release
+          # 一个产物都没有就让整个任务失败，绝不发布空 Release。
+          compgen -G "release/*.dmg" > /dev/null || { echo "缺少 macOS dmg" >&2; exit 1; }
+          compgen -G "release/*.exe" > /dev/null || { echo "缺少 Windows 安装程序" >&2; exit 1; }
 
       - name: 创建 Release
         uses: softprops/action-gh-release@v2
