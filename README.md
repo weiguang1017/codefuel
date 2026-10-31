@@ -33,8 +33,11 @@ Python 3.11+ · FastAPI · Uvicorn · SQLite · cryptography(Fernet) · Playwrig
 
 | 平台 | 文件 |
 |---|---|
-| macOS（Apple Silicon） | `CodeFuel-macOS-arm64.dmg` 或 `.zip` |
-| Windows 10/11 | `CodeFuel-*-setup.exe` 或免安装的 `CodeFuel-Windows-portable-*.zip` |
+| macOS（Apple Silicon，M 系列芯片） | `CodeFuel-macOS-arm64.dmg` |
+| macOS（Intel 芯片） | `CodeFuel-macOS-x86_64.dmg` |
+| Windows 10/11 | `CodeFuel-*-setup.exe` |
+
+仅分发 DMG 和 EXE 安装包，不再提供 ZIP 便携包。
 
 安装包未做代码签名。macOS 首次打开需右键 →「打开」；Windows 遇 SmartScreen 点「更多信息」→「仍要运行」。
 
@@ -59,7 +62,7 @@ uv run desktop.py --smoke             # 打开真实窗口读取页面后退出
 ## 打包
 
 ```bash
-bash build/build_macos.sh        # macOS：产出 .app、.zip、.dmg
+bash build/build_macos.sh        # macOS：产出 .app、.dmg（使用当前 Mac 架构）
 build\build_windows.bat          # Windows：产出 dist\CodeFuel\CodeFuel.exe
 ```
 

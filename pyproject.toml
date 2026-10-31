@@ -1,6 +1,6 @@
 [project]
 name = "codefuel"
-version = "0.3.0"
+version = "0.4.1"
 description = "码粮 CodeFuel：AnyRouter 与 AgentRouter 本地额度控制台"
 requires-python = ">=3.11"
 dependencies = [

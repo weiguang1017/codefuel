@@ -33,9 +33,17 @@ jobs:
       - run: uv run --locked pytest -q
 
   build-macos:
-    name: 构建 macOS 安装包
+    name: 构建 macOS · ${{ matrix.arch }}
     needs: test
-    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            arch: arm64
+          - os: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -58,22 +66,23 @@ jobs:
           uv run --locked pyinstaller --noconfirm --distpath dist --workpath build/pyinstaller-codefuel build/CodeFuel.spec
           ./dist/CodeFuel.app/Contents/MacOS/CodeFuel --selftest --port 18877
 
-      - name: 打包 dmg 与 zip
+      - name: 打包 DMG 并核对架构
         shell: bash
         run: |
           set -euo pipefail
           ARCH="$(lipo -archs dist/CodeFuel.app/Contents/MacOS/CodeFuel | xargs | tr ' ' '-')"
-          ditto -c -k --sequesterRsrc --keepParent dist/CodeFuel.app "dist/CodeFuel-macOS-${ARCH}.zip"
+          test "$ARCH" = "${{ matrix.arch }}" || { echo "应用架构不匹配：$ARCH" >&2; exit 1; }
+          NODE="$(find dist/CodeFuel.app/Contents -path '*/playwright/driver/node' -type f -print -quit)"
+          test -n "$NODE" || { echo "缺少 Playwright Node 驱动" >&2; exit 1; }
+          lipo -verify_arch "${{ matrix.arch }}" "$NODE"
           # CI 无图形会话，访达自动化不可用；-skip-layout 只跳过图标排版。
           bash build/make_dmg.sh dist/CodeFuel.app "dist/CodeFuel-macOS-${ARCH}.dmg" --skip-layout
           hdiutil verify "dist/CodeFuel-macOS-${ARCH}.dmg"
 
       - uses: actions/upload-artifact@v5
         with:
-          name: macos-installer
-          path: |
-            dist/*.dmg
-            dist/*.zip
+          name: macos-installer-${{ matrix.arch }}
+          path: dist/*.dmg
           if-no-files-found: error
 
   build-windows:
@@ -121,9 +130,7 @@ jobs:
       - uses: actions/upload-artifact@v5
         with:
           name: windows-installer
-          path: |
-            dist/*.exe
-            dist/CodeFuel/**
+          path: dist/*-setup.exe
           if-no-files-found: error
 
   release:
@@ -148,15 +155,11 @@ jobs:
           mkdir -p release
           # 按文件类型收拢，不用通配符 cp，避免静默失败。
           # 只发布安装器；Windows 便携版的内部文件（node.exe 等）不能单独上传。
-          find artifacts/macos-installer -type f \( -name '*.dmg' -o -name '*.zip' \) \
-            -exec cp -v {} release/ \;
+          for ARCH in arm64 x86_64; do
+            cp -v "artifacts/macos-installer-${ARCH}/CodeFuel-macOS-${ARCH}.dmg" release/
+          done
           find artifacts/windows-installer -maxdepth 1 -type f -name '*setup.exe' \
             -exec cp -v {} release/ \;
-          # Windows 便携目录单独压成 zip，避免 Release 里出现上千个散文件。
-          if [ -d artifacts/windows-installer/CodeFuel ]; then
-            VERSION="${GITHUB_REF_NAME#v}"
-            (cd artifacts/windows-installer && zip -qr "$GITHUB_WORKSPACE/release/CodeFuel-Windows-portable-${VERSION}.zip" CodeFuel)
-          fi
           echo "待上传："
           ls -lh release
           # 一个产物都没有就让整个任务失败，绝不发布空 Release。
@@ -164,7 +167,7 @@ jobs:
           compgen -G "release/*setup.exe" > /dev/null || { echo "缺少 Windows 安装程序" >&2; exit 1; }
           # 发布文件数量必须精简，避免把内部可执行文件散出去。
           COUNT=$(find release -maxdepth 1 -type f | wc -l)
-          [ "$COUNT" -le 4 ] || { echo "发布文件过多（$COUNT 个），请检查收集规则" >&2; exit 1; }
+          [ "$COUNT" -eq 3 ] || { echo "必须恰好发布 3 个安装包，实际 $COUNT 个" >&2; exit 1; }
 
       - name: 创建 Release
         uses: softprops/action-gh-release@v2
@@ -181,9 +184,8 @@ jobs:
             | 平台 | 文件 | 说明 |
             |---|---|---|
             | macOS（Apple Silicon） | `CodeFuel-macOS-arm64.dmg` | 双击挂载，把应用拖入「应用程序」 |
-            | macOS（Apple Silicon） | `CodeFuel-macOS-arm64.zip` | 解压后得到 `.app` |
+            | macOS（Intel） | `CodeFuel-macOS-x86_64.dmg` | 双击挂载，把应用拖入「应用程序」 |
             | Windows 10/11 | `CodeFuel-*-setup.exe` | 安装向导，可选安装目录 |
-            | Windows 10/11 | `CodeFuel-Windows-portable-*.zip` | 免安装，解压即用 |
 
             ## 首次打开提示
 
@@ -198,6 +200,4 @@ jobs:
             - 账号凭据用 Fernet 加密后保存在本机，不会上传。
           files: |
             release/*.dmg
-            release/CodeFuel-macOS-*.zip
             release/CodeFuel-*-setup.exe
-            release/CodeFuel-Windows-portable-*.zip
