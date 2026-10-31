@@ -1,0 +1,32 @@
+[project]
+name = "codefuel"
+version = "0.3.0"
+description = "码粮 CodeFuel：AnyRouter 与 AgentRouter 本地额度控制台"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn>=0.34",
+  "httpx[http2]>=0.27",
+  "cryptography>=44",
+  "cloakbrowser>=0.3.0",
+  "python-dotenv>=1.0",
+  "pywebview>=6.2.1",
+]
+
+[dependency-groups]
+dev = [
+    "pillow>=13.0.0",
+    "pyinstaller>=6.22.3",
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[[tool.uv.index]]
+url = "https://mirrors.aliyun.com/pypi/simple/"
+default = true

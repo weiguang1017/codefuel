@@ -1,0 +1,31 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 本地数据：加密数据库与密钥，绝不入库
+data/
+*.key
+*.db
+*.db-journal
+
+# 构建产物与临时物
+dist/
+build/pyinstaller/
+build/.pyinstaller/
+build/pyinstaller-codefuel/
+build/icon.iconset/
+build/*-selftest/
+build/test-*/
+build/selftest-data/
+build/dmg-selftest/
+build/node-strip-evaluation
+tests/.tmp/
+tests/tmpapp/
+checkin_screenshots/
+
+# 系统与编辑器
+.DS_Store
+.idea/
+.vscode/
