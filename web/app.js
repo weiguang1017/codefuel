@@ -133,7 +133,7 @@ function credentialFields(method,editing=false){
   const f=$('#credentials');if(!f)return;
   if(isBrowser(method)){
     const label=methodName(method);
-    f.innerHTML=`<div class="auth-hint">${icon(isOAuth(method)?method:'users','brand-icon')}<div><b>${isOAuth(method)?`使用 ${label} 授权登录`:'在浏览器中手动登录'}</b><p>${isOAuth(method)?'按所选平台依次打开独立授权窗口；每个平台经后端确认成功后才会保存，并继续下一个。':'在当前平台的浏览器窗口中登录，完成后校验并保存为浏览器登录账号。'}</p></div></div>${isOAuth(method)?`<div class="notice">${icon('info')}如果平台不支持或未提供 ${label} 入口，会明确显示原因；你可以重试或跳过，不会将其他登录方式冒充为 ${label} 授权。</div>`:''}`;
+    f.innerHTML=`<div class="auth-hint">${icon(isOAuth(method)?method:'users','brand-icon')}<div><b>${isOAuth(method)?`使用 ${label} 授权登录`:'在浏览器中手动登录'}</b><p>${isOAuth(method)?'按所选平台依次打开独立授权窗口，不共享日常浏览器的登录状态；请在本次窗口内登录并授权，每个平台经后端确认成功后才会保存。':'在当前平台的浏览器窗口中登录，完成后校验并保存为浏览器登录账号。'}</p></div></div>${isOAuth(method)?`<div class="notice">${icon('info')}无需先在日常浏览器登录 ${label}；请在授权窗口完成登录及网站验证。AnyRouter 会在入口未显示时尝试站内「注册 → 登录」导航，不会提交注册信息；仍未找到时可重试或跳过。</div>`:''}`;
     return;
   }
   const preserve=editing&&accountMethod(state.editing)===method;

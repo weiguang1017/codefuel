@@ -546,6 +546,7 @@ async def test_missing_oauth_entry_is_unavailable_without_fallback(db, monkeypat
     monkeypatch.setattr(login, 'wait_for_waf_ready', AsyncMock())
     flow = login.LoginFlow(db)
     monkeypatch.setattr(flow, '_click_oauth', AsyncMock(return_value=False))
+    monkeypatch.setattr(flow, '_navigate_login_link', AsyncMock(return_value=False))
     verify = AsyncMock()
     monkeypatch.setattr(login, 'verify_target_profile', verify)
     session = login.LoginSession(provider, method, '测试')
@@ -842,3 +843,117 @@ async def test_relogin_updates_metadata_only_after_identity_verified(db):
     assert row['next_run'] > iso(utcnow() + timedelta(hours=11))
     assert db.credentials(row)['session'] == 'accepted'
     assert '新备注' in accepted.message
+
+
+@pytest.mark.parametrize('method', ['linuxdo', 'github'])
+@pytest.mark.asyncio
+async def test_anyrouter_oauth_navigates_register_then_login_when_missing(db, monkeypatch, method):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from backend.login_flow import LoginFlow, LoginSession
+    from backend.providers import PROVIDERS
+    flow = LoginFlow(db)
+    provider = PROVIDERS['anyrouter']
+    page = SimpleNamespace(url=provider.domain + '/login')
+    session = LoginSession('anyrouter', method, '导航测试')
+    click = AsyncMock(side_effect=[False, True])
+    nav = AsyncMock(return_value=True)
+    monkeypatch.setattr(flow, '_click_oauth', click)
+    monkeypatch.setattr(flow, '_navigate_login_link', nav)
+    assert await flow._open_oauth(None, page, session, provider)
+    assert click.await_count == 2
+    assert [call.args[2:] for call in nav.await_args_list] == [('/login', '/register'), ('/register', '/login')]
+    assert db.accounts() == []
+
+
+@pytest.mark.parametrize('provider_id', ['anyrouter', 'agentrouter'])
+@pytest.mark.asyncio
+async def test_visible_oauth_does_not_navigate_registration(db, monkeypatch, provider_id):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from backend.login_flow import LoginFlow, LoginSession
+    from backend.providers import PROVIDERS
+    flow = LoginFlow(db)
+    provider = PROVIDERS[provider_id]
+    click = AsyncMock(return_value=True)
+    nav = AsyncMock()
+    monkeypatch.setattr(flow, '_click_oauth', click)
+    monkeypatch.setattr(flow, '_navigate_login_link', nav)
+    assert await flow._open_oauth(None, SimpleNamespace(url=provider.domain + '/login'),
+                                LoginSession(provider_id, 'linuxdo', '测试'), provider)
+    click.assert_awaited_once()
+    nav.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_agentrouter_missing_entry_never_uses_anyrouter_navigation(db, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from backend.login_flow import LoginFlow, LoginSession
+    from backend.providers import PROVIDERS
+    flow = LoginFlow(db)
+    monkeypatch.setattr(flow, '_click_oauth', AsyncMock(return_value=False))
+    nav = AsyncMock()
+    monkeypatch.setattr(flow, '_navigate_login_link', nav)
+    assert not await flow._open_oauth(None, SimpleNamespace(url='https://agentrouter.org/login'),
+                                    LoginSession('agentrouter', 'linuxdo', '测试'), PROVIDERS['agentrouter'])
+    nav.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_anyrouter_cancel_after_register_stops_navigation(db, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from backend.login_flow import LoginFlow, LoginSession
+    from backend.providers import PROVIDERS
+    flow = LoginFlow(db)
+    session = LoginSession('anyrouter', 'linuxdo', '测试')
+    click = AsyncMock(return_value=False)
+    async def navigate(*args):
+        session.cancelled = True
+        return True
+    nav = AsyncMock(side_effect=navigate)
+    monkeypatch.setattr(flow, '_click_oauth', click)
+    monkeypatch.setattr(flow, '_navigate_login_link', nav)
+    assert not await flow._open_oauth(None, SimpleNamespace(url='https://anyrouter.top/login'), session, PROVIDERS['anyrouter'])
+    click.assert_awaited_once()
+    nav.assert_awaited_once()
+    assert db.accounts() == []
+
+
+@pytest.mark.asyncio
+async def test_registration_navigation_follows_only_existing_site_link(db):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+    from backend.login_flow import LoginFlow
+    from backend.providers import PROVIDERS
+    page = SimpleNamespace(url='https://anyrouter.top/login')
+    async def attribute(name):
+        return '/register?from=login' if name == 'href' else None
+    async def click(**kwargs):
+        page.url = 'https://anyrouter.top/register?from=login'
+    link = SimpleNamespace(is_visible=AsyncMock(return_value=True), is_enabled=AsyncMock(return_value=True),
+                           get_attribute=AsyncMock(side_effect=attribute), click=AsyncMock(side_effect=click))
+    page.get_by_role = Mock(return_value=SimpleNamespace(count=AsyncMock(return_value=1), nth=Mock(return_value=link)))
+    async def wait_for_url(predicate, **kwargs):
+        assert predicate(page.url)
+    page.wait_for_url = AsyncMock(side_effect=wait_for_url)
+    assert await LoginFlow(db)._navigate_login_link(page, PROVIDERS['anyrouter'], '/login', '/register')
+    page.get_by_role.assert_called_once_with('link')
+    link.click.assert_awaited_once()
+
+
+@pytest.mark.parametrize('href', ['https://other.test/register', '/help', 'javascript:void(0)', ''])
+@pytest.mark.asyncio
+async def test_unrelated_links_are_not_registration_navigation(db, monkeypatch, href):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+    import backend.login_flow as login
+    ticks = iter([0, 0, login.OAUTH_ENTRY_TIMEOUT + 1])
+    monkeypatch.setattr(login, 'time', SimpleNamespace(monotonic=lambda: next(ticks)))
+    link = SimpleNamespace(is_visible=AsyncMock(return_value=True), is_enabled=AsyncMock(return_value=True),
+                           get_attribute=AsyncMock(return_value=href), click=AsyncMock())
+    links = SimpleNamespace(count=AsyncMock(return_value=1), nth=Mock(return_value=link))
+    page = SimpleNamespace(url='https://anyrouter.top/login', get_by_role=Mock(return_value=links))
+    assert not await login.LoginFlow(db)._navigate_login_link(page, login.PROVIDERS['anyrouter'], '/login', '/register')
+    link.click.assert_not_awaited()

@@ -188,14 +188,16 @@ class LoginFlow:
                 if _origin(page.url) != _origin(provider.domain):
                     session.status, session.message = 'failed', '未能打开目标平台登录页，授权未保存。'
                     return
-                clicked = await self._click_oauth(context, page, session.method, provider)
+                session.message = f'正在查找 {label} 登录入口；请保持窗口打开。'
+                clicked = await self._open_oauth(context, page, session, provider)
                 if session.cancelled:
                     return
                 if not clicked:
                     session.status = 'unavailable'
-                    session.message = f'该平台登录页未提供可用的 {label} 授权入口；未保存账号。可另行选择手动登录。'
+                    session.message = f'当前页面未提供可识别的 {label} 授权入口，未保存账号；这不代表平台一定不支持。可重试或选择浏览器手动登录。'
                     return
-                session.message = f'请在打开的 {label} 窗口中完成授权；完成后方可关闭窗口。'
+                session.message = (f'请在本次打开的浏览器中登录 {label} 并确认授权，返回目标平台后自动校验；'
+                                   '此窗口不共享日常浏览器登录状态，遇网站验证请手动完成。')
             else:
                 session.message = '请在打开的浏览器窗口中完成登录，登录成功后会自动保存。'
             deadline = time.monotonic() + WINDOW_TIMEOUT
@@ -214,7 +216,7 @@ class LoginFlow:
                     if session.cancelled or session.status not in ACTIVE_STATUSES:
                         return
                     session.status = 'waiting'
-                    session.message = '已登录但账号校验未通过，请在窗口中打开目标平台控制台后稍候。'
+                    session.message = '检测到站点 Cookie，但尚未确认登录成功；请完成登录及授权，返回目标平台控制台后稍候。'
                 await asyncio.sleep(1.5)
             session.status, session.message = 'expired', '等待超时，请重新发起授权。'
         except asyncio.CancelledError:
@@ -231,6 +233,61 @@ class LoginFlow:
                     await browser.close()
                 except Exception:
                     pass
+
+    async def _open_oauth(self, context, page, session, provider):
+        if await self._click_oauth(context, page, session.method, provider):
+            return True
+        if session.cancelled:
+            return False
+        paths = provider.oauth_navigation_paths
+        if not paths or urlparse(page.url).path.rstrip('/') != provider.login_path.rstrip('/'):
+            return False
+        # AnyRouter 的入口可能只在站内「注册 → 登录」导航后渲染。
+        # 只点击当前页面已有的同源链接，不填表、不提交注册、不构造授权 URL。
+        previous_path = provider.login_path
+        for path in paths:
+            if session.cancelled:
+                return False
+            session.message = '正在通过站内「注册 → 登录」导航重新查找授权入口，不会提交注册信息。'
+            if not await self._navigate_login_link(page, provider, previous_path, path):
+                return False
+            previous_path = path
+        if session.cancelled:
+            return False
+        return await self._click_oauth(context, page, session.method, provider)
+
+    async def _navigate_login_link(self, page, provider, source_path, target_path):
+        """仅跟随当前页面可见的同源路径链接；绝不点击注册表单提交按钮。"""
+        origin = _origin(provider.domain)
+        deadline = time.monotonic() + OAUTH_ENTRY_TIMEOUT
+        while time.monotonic() < deadline:
+            if (_origin(page.url) != origin
+                    or urlparse(page.url).path.rstrip('/') != source_path.rstrip('/')):
+                return False
+            links = page.get_by_role('link')
+            for index in range(await links.count()):
+                link = links.nth(index)
+                if not await link.is_visible() or not await link.is_enabled():
+                    continue
+                href = await link.get_attribute('href')
+                if not href:
+                    continue
+                target = urlparse(urljoin(page.url, href))
+                if (_origin(target.geturl()) != origin
+                        or target.path.rstrip('/') != target_path.rstrip('/')
+                        or await link.get_attribute('target') not in (None, '', '_self')):
+                    continue
+                if (_origin(page.url) != origin
+                        or urlparse(page.url).path.rstrip('/') != source_path.rstrip('/')):
+                    return False
+                await link.click(timeout=6000)
+                await page.wait_for_url(
+                    lambda url: _origin(str(url)) == origin
+                    and urlparse(str(url)).path.rstrip('/') == target_path.rstrip('/'),
+                    timeout=12000, wait_until='domcontentloaded')
+                return _origin(page.url) == origin and urlparse(page.url).path.rstrip('/') == target_path.rstrip('/')
+            await asyncio.sleep(0.25)
+        return False
 
     async def _click_oauth(self, context, page, method, provider):
         """有界等待站点自身入口；点击一次后交还站点完成跳转。"""
