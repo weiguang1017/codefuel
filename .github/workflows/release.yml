@@ -1,0 +1,190 @@
+# 推送 v* 标签时：构建 macOS 与 Windows 安装包，并创建 GitHub Release。
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 要发布的标签名（需已存在），例如 v0.3.0
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: 测试
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --locked --dev
+      - run: uv run --locked pytest -q
+
+  build-macos:
+    name: 构建 macOS 安装包
+    needs: test
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --locked --dev
+
+      - name: 生成图标
+        run: |
+          uv run --locked python build/make_icon.py
+          iconutil -c icns -o build/icon.icns build/icon.iconset
+
+      - name: 编译并自检
+        env:
+          PYINSTALLER_CONFIG_DIR: ${{ github.workspace }}/build/.pyinstaller
+        run: |
+          uv run --locked pyinstaller --noconfirm --distpath dist --workpath build/pyinstaller-codefuel build/CodeFuel.spec
+          ./dist/CodeFuel.app/Contents/MacOS/CodeFuel --selftest --port 18877
+
+      - name: 打包 dmg 与 zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCH="$(lipo -archs dist/CodeFuel.app/Contents/MacOS/CodeFuel | xargs | tr ' ' '-')"
+          ditto -c -k --sequesterRsrc --keepParent dist/CodeFuel.app "dist/CodeFuel-macOS-${ARCH}.zip"
+          # CI 无图形会话，访达自动化不可用；-skip-layout 只跳过图标排版。
+          bash build/make_dmg.sh dist/CodeFuel.app "dist/CodeFuel-macOS-${ARCH}.dmg" --skip-layout
+          hdiutil verify "dist/CodeFuel-macOS-${ARCH}.dmg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-installer
+          path: |
+            dist/*.dmg
+            dist/*.zip
+          if-no-files-found: error
+
+  build-windows:
+    name: 构建 Windows 安装包
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --locked --dev
+
+      - name: 生成图标
+        run: uv run --locked python build/make_icon.py
+
+      - name: 编译并自检
+        shell: pwsh
+        env:
+          PYINSTALLER_CONFIG_DIR: ${{ github.workspace }}\build\.pyinstaller
+        run: |
+          uv run --locked pyinstaller --noconfirm --distpath dist --workpath build/pyinstaller-codefuel build/CodeFuel.spec
+          if (-not (Test-Path 'dist\CodeFuel\CodeFuel.exe')) { throw '未生成 CodeFuel.exe' }
+          $p = Start-Process -FilePath 'dist\CodeFuel\CodeFuel.exe' -ArgumentList '--selftest','--port','18877' -PassThru -NoNewWindow
+          if (-not $p.WaitForExit(120000)) { $p.Kill(); throw '自检超时' }
+          if ($p.ExitCode -ne 0) { throw "自检失败，退出码 $($p.ExitCode)" }
+
+      - name: 安装 Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          Add-Content $env:GITHUB_PATH "C:\Program Files (x86)\Inno Setup 6"
+
+      - name: 制作安装程序
+        shell: pwsh
+        run: |
+          $version = "${{ inputs.tag || github.ref_name }}".TrimStart('v')
+          if (-not $version) { $version = '0.0.0' }
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$version" "build\installer.iss"
+          Get-ChildItem dist\*.exe | Select-Object Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: |
+            dist/*.exe
+            dist/CodeFuel/**
+          if-no-files-found: error
+
+  release:
+    name: 发布 Release
+    needs: [build-macos, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: 整理发布文件
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find artifacts -maxdepth 1 -mindepth 1 -type d \
+            \( -name 'macos-installer' -o -name 'windows-installer' \) -print0 \
+            | xargs -0 -I{} cp -R {}/* release/ 2>/dev/null || true
+          # Windows 便携目录单独压成 zip，避免 Release 里出现散落的上千个文件。
+          if [ -d release/CodeFuel ]; then
+            (cd release && zip -qr "CodeFuel-Windows-portable-$(echo "${GITHUB_REF_NAME}" | sed 's/^v//').zip" CodeFuel)
+            rm -rf release/CodeFuel
+          fi
+          ls -lh release
+
+      - name: 创建 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: 码粮 CodeFuel ${{ inputs.tag || github.ref_name }}
+          draft: false
+          generate_release_notes: true
+          body: |
+            为代码添粮，让灵感续航。
+
+            ## 下载
+
+            | 平台 | 文件 | 说明 |
+            |---|---|---|
+            | macOS（Apple Silicon） | `CodeFuel-macOS-arm64.dmg` | 双击挂载，把应用拖入「应用程序」 |
+            | macOS（Apple Silicon） | `CodeFuel-macOS-arm64.zip` | 解压后得到 `.app` |
+            | Windows 10/11 | `CodeFuel-*-setup.exe` | 安装向导，可选安装目录 |
+            | Windows 10/11 | `CodeFuel-Windows-portable-*.zip` | 免安装，解压即用 |
+
+            ## 首次打开提示
+
+            安装包**未做代码签名与公证**，系统可能拦截：
+
+            - **macOS**：右键点应用 →「打开」，或到「系统设置 → 隐私与安全性」点「仍要打开」。
+            - **Windows**：SmartScreen 提示时点「更多信息」→「仍要运行」。
+
+            ## 运行要求
+
+            - 需要本机已安装 **Google Chrome**（签到复用系统浏览器，不额外下载 Chromium）。
+            - 账号凭据用 Fernet 加密后保存在本机，不会上传。
+          files: |
+            release/*.dmg
+            release/*.zip
+            release/*.exe

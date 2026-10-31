@@ -1,11 +1,21 @@
 #!/bin/bash
 # 把 CodeFuel.app 打成带「拖入应用程序」布局的 macOS 安装镜像。
-# 用法: build/make_dmg.sh [app路径] [输出dmg路径]
+# 用法: build/make_dmg.sh [app路径] [输出dmg路径] [--skip-layout]
+#   --skip-layout  跳过访达图标排版（CI 等无图形会话环境用）
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-APP="${1:-dist/release-0.3.0/CodeFuel.app}"
-OUT="${2:-dist/release-0.3.0/CodeFuel-0.3.0-macOS-arm64.dmg}"
+SKIP_LAYOUT=0
+POSITIONAL=()
+for arg in "$@"; do
+  case "$arg" in
+    --skip-layout) SKIP_LAYOUT=1 ;;
+    *) POSITIONAL+=("$arg") ;;
+  esac
+done
+
+APP="${POSITIONAL[0]:-dist/CodeFuel.app}"
+OUT="${POSITIONAL[1]:-dist/CodeFuel-macOS-$(uname -m).dmg}"
 VOLUME="CodeFuel"   # 固定卷名：AppleScript 用 disk "CodeFuel" 定位，避免空格/中文失败
 
 [[ -d "$APP" ]] || { echo "找不到应用：$APP" >&2; exit 1; }
@@ -30,8 +40,10 @@ hdiutil create -quiet -srcfolder "$STAGE" -volname "$VOLUME" -fs HFS+ \
   -format UDRW -size "${SIZE_KB}k" "$RW"
 hdiutil attach "$RW" -mountpoint "$MNT" -noautoopen -quiet
 
-# 只是视觉排版；无图形会话时跳过，DMG 仍完全可用。
-if osascript <<'APPLESCRIPT' >/dev/null 2>&1
+# 只是视觉排版；显式跳过或没有图形会话时不做，DMG 仍完全可用。
+if [[ "$SKIP_LAYOUT" == "1" ]]; then
+  echo "已跳过图标排版（--skip-layout）。"
+elif osascript <<'APPLESCRIPT' >/dev/null 2>&1
 tell application "Finder"
   tell disk "CodeFuel"
     open

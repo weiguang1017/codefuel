@@ -1,0 +1,90 @@
+# 每次提交/PR：跑测试并验证两类平台能编译出产物（不发布）。
+name: CI
+
+on:
+  push:
+    branches: ['**']
+    tags-ignore: ['**']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: 测试 · Python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: 同步依赖
+        run: uv sync --locked --dev --python ${{ matrix.python }}
+
+      - name: 运行测试
+        run: uv run --locked pytest -q
+
+  build:
+    name: 编译验证 · ${{ matrix.name }}
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS (Apple Silicon)
+            os: macos-14
+          - name: Windows
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: 同步依赖
+        run: uv sync --locked --dev
+
+      - name: 生成图标
+        run: uv run --locked python build/make_icon.py
+
+      - name: 编译应用
+        shell: bash
+        env:
+          PYINSTALLER_CONFIG_DIR: ${{ github.workspace }}/build/.pyinstaller
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            iconutil -c icns -o build/icon.icns build/icon.iconset
+            uv run --locked pyinstaller --noconfirm --distpath dist --workpath build/pyinstaller-codefuel build/CodeFuel.spec
+            ./dist/CodeFuel.app/Contents/MacOS/CodeFuel --selftest --port 18877
+          else
+            uv run --locked pyinstaller --noconfirm --distpath dist --workpath build/pyinstaller-codefuel build/CodeFuel.spec
+            ./dist/CodeFuel/CodeFuel.exe --selftest --port 18877
+          fi
+
+      - name: 上传编译产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: CodeFuel-${{ matrix.os }}-unsigned
+          path: |
+            dist/CodeFuel.app
+            dist/CodeFuel
+          if-no-files-found: warn
+          retention-days: 7
