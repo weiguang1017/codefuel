@@ -275,6 +275,24 @@ def test_login_flow_single_window_and_cancel(client, monkeypatch):
     assert client.get('/api/login/unknown-session').status_code == 404
 
 
+@pytest.mark.parametrize('initial,expected', [('waiting', 'cancelled'), ('success', 'success')])
+def test_cancel_response_reports_final_status(client, initial, expected):
+    from backend.login_flow import LoginSession
+    session = LoginSession('agentrouter', 'github', '取消结果测试')
+    session.status = initial
+    if initial == 'success':
+        session.account = 42
+    main.login_flow.sessions[session.id] = session
+    response = client.post(f'/api/login/{session.id}/cancel', json={}, headers=client.write_headers)
+    assert response.status_code == 200
+    body = response.json()
+    assert body['ok'] is True
+    assert body['status'] == expected
+    assert body['provider'] == 'agentrouter'
+    assert body['account_id'] == (42 if initial == 'success' else None)
+    assert 'session' not in body and 'encrypted' not in body
+
+
 @pytest.mark.asyncio
 async def test_oauth_persist_creates_encrypted_session_account(db):
     from backend.login_flow import LoginFlow, LoginSession

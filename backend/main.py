@@ -194,7 +194,8 @@ def login_status(session_id: str):
 
 @app.post('/api/login/{session_id}/cancel')
 async def cancel_login(session_id: str):
-    return {'ok': login_flow.cancel(session_id)}
+    cancelled = login_flow.cancel(session_id)
+    return {'ok': cancelled, **(login_flow.view(session_id) or {})}
 
 
 @app.get('/api/health')
