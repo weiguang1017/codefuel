@@ -16,10 +16,53 @@ def test_codefuel_homepage_brand(client):
     assert 'DailyQuota' not in response.text
 
 
-def test_brand_keeps_legacy_storage_namespace():
-    from backend.paths import APP_NAME, DATA_NAMESPACE
+def test_brand_uses_codefuel_storage_namespace():
+    from backend.paths import APP_NAME, DATA_NAMESPACE, DB_NAME, LEGACY_NAMESPACE
     assert APP_NAME == '码粮 CodeFuel'
-    assert DATA_NAMESPACE == 'DailyQuota'
+    assert DATA_NAMESPACE == 'CodeFuel'
+    assert DB_NAME == 'codefuel.db'
+    assert LEGACY_NAMESPACE == 'DailyQuota'
+
+
+def test_legacy_data_migrates_into_new_namespace(tmp_path, monkeypatch):
+    """改名后首次启动必须能接上旧账号，且不覆盖已有数据。"""
+    from backend import paths
+
+    legacy = tmp_path / 'DailyQuota'
+    legacy.mkdir()
+    (legacy / 'dailyquota.db').write_bytes(b'old-db')
+    (legacy / 'secret.key').write_bytes(b'old-key')
+    (legacy / 'secret.key').chmod(0o600)
+
+    monkeypatch.setattr(paths, '_platform_data_root', lambda: tmp_path)
+    monkeypatch.delenv('CODEFUEL_DATA_DIR', raising=False)
+    monkeypatch.delenv('DAILYQUOTA_DATA_DIR', raising=False)
+
+    target = tmp_path / 'CodeFuel'
+    moved = paths.migrate_legacy_data(target)
+    assert moved == ['dailyquota.db → codefuel.db', 'secret.key → secret.key']
+    assert (target / 'codefuel.db').read_bytes() == b'old-db'
+    assert (target / 'secret.key').read_bytes() == b'old-key'
+    # 旧目录必须保留，迁移可回退。
+    assert (legacy / 'dailyquota.db').exists()
+
+
+def test_migration_never_overwrites_existing_data(tmp_path, monkeypatch):
+    from backend import paths
+
+    legacy = tmp_path / 'DailyQuota'
+    legacy.mkdir()
+    (legacy / 'dailyquota.db').write_bytes(b'old-db')
+    target = tmp_path / 'CodeFuel'
+    target.mkdir()
+    (target / 'codefuel.db').write_bytes(b'new-db')
+
+    monkeypatch.setattr(paths, '_platform_data_root', lambda: tmp_path)
+    monkeypatch.delenv('CODEFUEL_DATA_DIR', raising=False)
+    monkeypatch.delenv('DAILYQUOTA_DATA_DIR', raising=False)
+
+    assert paths.migrate_legacy_data(target) == []
+    assert (target / 'codefuel.db').read_bytes() == b'new-db'
 
 
 def test_codefuel_data_dir_override(tmp_path, monkeypatch):

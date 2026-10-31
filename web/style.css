@@ -20,3 +20,21 @@
 .auth-steps li::before{content:'';width:6px;height:6px;border-radius:50%;background:#dfe5e1;flex:none}
 .auth-steps li.on{color:#45634f}
 .auth-steps li.on::before{background:#7fb48f}
+/* 推荐注册卡片：侧栏醒目入口 */
+.referral-card{margin:18px 3px 0;padding:13px 12px;display:flex;gap:10px;align-items:flex-start;background:linear-gradient(135deg,#fbf6ec,#f6faf5);border:1px solid #ebdfc9;border-radius:9px;font-size:11px;color:#7a6742;font-weight:550;transition:.15s}
+.referral-card:hover{border-color:#ddc79c;transform:translateY(-1px);box-shadow:0 3px 10px #a7763614}
+.referral-card svg{width:17px;height:17px;color:#a77636;flex:none;margin-top:1px}
+.referral-card span{display:block;font-size:8px;letter-spacing:.7px;color:#ad9b78;margin-top:4px;font-weight:400}
+/* 概览页推荐横幅 */
+.referral-banner{display:flex;align-items:center;gap:18px;padding:17px 21px;margin-bottom:19px;background:linear-gradient(115deg,#fdfaf3 0%,#f7faf6 62%,#f2f7f2 100%);border:1px solid #ecdfc8;border-radius:11px}
+.referral-banner-icon{width:41px;height:41px;border-radius:11px;background:#fff8e9;border:1px solid #f0e2c8;display:grid;place-items:center;color:#a77636;flex:none}
+.referral-banner-icon svg{width:21px;height:21px}
+.referral-banner-text{flex:1;min-width:0}
+.referral-banner-text b{display:block;font-size:13px;color:#5c4a2c;font-weight:650}
+.referral-banner-text b em{font-style:normal;color:#a77636}
+.referral-banner-text p{font-size:10px;color:#9d9077;margin-top:3px}
+.referral-banner-links{display:flex;gap:9px;flex:none}
+.referral-link{display:inline-flex;align-items:center;gap:7px;height:32px;padding:0 13px;border-radius:999px;background:#fff;border:1px solid #e6dbc4;font-size:11px;color:#6b5a3a;font-weight:550;transition:.15s}
+.referral-link:hover{border-color:#cdb185;background:#fffcf5;transform:translateY(-1px)}
+.referral-link svg{width:13px;height:13px;color:#a98b5b}
+@media(max-width:760px){.referral-card{display:none}.referral-banner{flex-wrap:wrap;gap:12px}}

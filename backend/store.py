@@ -7,7 +7,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from cryptography.fernet import Fernet, InvalidToken
-from .paths import data_dir
+from .paths import DB_NAME, data_dir
 
 DATA_DIR = data_dir()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -27,7 +27,7 @@ def iso(dt=None):
 
 class Store:
     def __init__(self, db_path=None, key_path=None):
-        self.db_path = Path(db_path or DATA_DIR / 'dailyquota.db')
+        self.db_path = Path(db_path or DATA_DIR / DB_NAME)
         self.key_path = Path(key_path or DATA_DIR / 'secret.key')
         self.lock = threading.RLock()
         if not self.key_path.exists():

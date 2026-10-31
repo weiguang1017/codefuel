@@ -48,6 +48,14 @@ async def main():
         assert 'CodeFuel' in await page.locator('.brand').inner_text()
         assert await page.locator('#page-title').inner_text() == '为代码添粮，让灵感续航。'
         assert await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth')
+        # 推荐注册入口必须真实可点，且指向正确的专属链接。
+        banner = page.locator('.referral-banner')
+        assert await banner.count() == 1
+        assert '$50.00' in await banner.inner_text()
+        hrefs = await page.locator('.referral-link').evaluate_all('els => els.map(e => e.href)')
+        assert 'https://agentrouter.org/register?aff=MBCp' in hrefs, hrefs
+        assert 'https://anyrouter.top/register?aff=x73u' in hrefs, hrefs
+        assert await page.locator('.referral-card').count() == 1
         await clean(page)
         await page.reload(wait_until='networkidle')
 

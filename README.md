@@ -4,6 +4,17 @@
 
 面向开发者的桌面签到与额度控制台，自动完成 **AnyRouter** 与 **AgentRouter** 的每日签到，集中展示额度、运行记录与调度状态。仅支持 macOS 与 Windows 桌面端。
 
+## 🎁 注册即多得 $50.00 额度
+
+还没注册账号？通过下面的专属链接注册，**可额外获得 $50.00 奖励额度**：
+
+| 平台 | 专属注册链接 |
+|---|---|
+| **AgentRouter** | <https://agentrouter.org/register?aff=MBCp> |
+| **AnyRouter** | <https://anyrouter.top/register?aff=x73u> |
+
+注册后把账号加进码粮，每日签到即可持续累积额度。
+
 ## 特性
 
 - **自动签到**：按账号设定间隔在后台执行，休眠或关机后的到期任务会在下次启动时补做。
@@ -16,6 +27,19 @@
 
 Python 3.11+ · FastAPI · Uvicorn · SQLite · cryptography(Fernet) · Playwright · pywebview · PyInstaller
 
+## 下载安装
+
+到 [Releases](https://github.com/weiguang1017/codefuel/releases) 下载：
+
+| 平台 | 文件 |
+|---|---|
+| macOS（Apple Silicon） | `CodeFuel-macOS-arm64.dmg` 或 `.zip` |
+| Windows 10/11 | `CodeFuel-*-setup.exe` 或免安装的 `CodeFuel-Windows-portable-*.zip` |
+
+安装包未做代码签名。macOS 首次打开需右键 →「打开」；Windows 遇 SmartScreen 点「更多信息」→「仍要运行」。
+
+**运行前提**：本机需已安装 **Google Chrome**，签到复用系统浏览器，不额外下载 Chromium。
+
 ## 开发
 
 ```bash
@@ -23,8 +47,6 @@ uv sync --dev          # 安装依赖
 uv run pytest -q       # 运行测试
 uv run desktop.py      # 启动桌面窗口
 ```
-
-浏览器能力复用系统已安装的 Google Chrome（通过 `CLOAKBROWSER_BINARY_PATH` 指定），无需额外下载 Chromium。
 
 ### 常用自检
 
@@ -41,16 +63,16 @@ bash build/build_macos.sh        # macOS：产出 .app、.zip、.dmg
 build\build_windows.bat          # Windows：产出 dist\CodeFuel\CodeFuel.exe
 ```
 
-产物写入 `dist/`，不进版本库。
+推送 `v*` 标签会触发 GitHub Actions 自动构建两个平台的安装包并发布 Release。
 
 ## 数据位置
 
 | 平台 | 路径 |
 |---|---|
-| macOS | `~/Library/Application Support/DailyQuota` |
-| Windows | `%APPDATA%\DailyQuota` |
+| macOS | `~/Library/Application Support/CodeFuel` |
+| Windows | `%APPDATA%\CodeFuel` |
 
-目录名沿用 `DailyQuota` 是为了让改名前的账号与密钥继续可用。可用环境变量 `CODEFUEL_DATA_DIR` 覆盖。
+从旧版本升级时，`DailyQuota` 目录下的数据库与密钥会在首次启动自动复制过来，旧数据保留不删。也可用环境变量 `CODEFUEL_DATA_DIR` 指定其它位置。
 
 ## 免责声明
 
@@ -58,4 +80,4 @@ build\build_windows.bat          # Windows：产出 dist\CodeFuel\CodeFuel.exe
 
 ## 许可
 
-`vendor/full-upstream/` 下的签到逻辑派生自 [millylee/anyrouter-check-in](https://github.com/millylee/anyrouter-check-in)，遵循 BSD-2-Clause，原始许可证保留在 `vendor/full-upstream/LICENSE`。
+签到逻辑部分遵循 BSD-2-Clause，原始许可证保留在 `vendor/full-upstream/LICENSE`。

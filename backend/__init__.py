@@ -1,1 +1,1 @@
-"""DailyQuota local application."""
+"""码粮 CodeFuel local application."""
