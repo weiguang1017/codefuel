@@ -74,7 +74,7 @@ jobs:
           test "$ARCH" = "${{ matrix.arch }}" || { echo "应用架构不匹配：$ARCH" >&2; exit 1; }
           NODE="$(find dist/CodeFuel.app/Contents -path '*/playwright/driver/node' -type f -print -quit)"
           test -n "$NODE" || { echo "缺少 Playwright Node 驱动" >&2; exit 1; }
-          lipo -verify_arch "${{ matrix.arch }}" "$NODE"
+          lipo "$NODE" -verify_arch "${{ matrix.arch }}"
           # CI 无图形会话，访达自动化不可用；-skip-layout 只跳过图标排版。
           bash build/make_dmg.sh dist/CodeFuel.app "dist/CodeFuel-macOS-${ARCH}.dmg" --skip-layout
           hdiutil verify "dist/CodeFuel-macOS-${ARCH}.dmg"
