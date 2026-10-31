@@ -136,14 +136,28 @@ class Store:
             self.db.commit()
             return cur.lastrowid
 
-    def apply_login(self, account_id, session, api_user, login_via, balance=None, used_quota=None):
-        """Store a freshly authorized browser session without exposing it anywhere else."""
+    def apply_login(self, account_id, session, api_user, login_via, balance=None, used_quota=None, *, provider,
+                    name=None, interval_hours=None):
+        """保存前再次核对平台、运行状态和已有站点身份。"""
         with self.lock:
-            if not self.account(account_id):
+            row = self.account(account_id)
+            if not row:
                 return False
+            if row['provider'] != provider:
+                raise ValueError('重新授权的平台与原账号不一致，登录状态未保存。')
+            if row['status'] in ('queued', 'running'):
+                raise ValueError('账号正在排队或运行，登录状态未保存。')
+            previous_user = self.credentials(row).get('api_user')
+            if previous_user is not None and str(previous_user) != str(api_user):
+                raise ValueError('本次授权身份与原账号不同，请单独添加账号，登录状态未保存。')
             updates = {'auth_mode': 'session',
                        'encrypted': self.encrypt_credentials({'session': session, 'api_user': str(api_user)}),
                        'login_via': login_via, 'status': 'idle', 'last_message': '登录状态已更新'}
+            if name:
+                updates['name'] = name[:40]
+            if interval_hours is not None:
+                updates.update(interval_hours=interval_hours,
+                               next_run=iso(utcnow() + timedelta(hours=interval_hours)))
             if balance is not None:
                 updates.update(balance=balance, used_quota=used_quota, has_snapshot=1,
                                total_quota=round(balance + (used_quota or 0), 2))
@@ -151,23 +165,27 @@ class Store:
             return True
 
     def update_account(self, account_id, data):
-        row = self.account(account_id)
-        if not row:
-            return False
-        old = self.credentials(row)
-        for key in ('email', 'password', 'session', 'api_user'):
-            if data.get(key):
-                old[key] = data[key]
-        if data.get('auth_mode') == 'session':
-            old = {'session': old['session'], 'api_user': old['api_user']}
-        elif data.get('auth_mode') == 'password':
-            old = {k: old[k] for k in ('email', 'password') if old.get(k)}
-        login_via = data.get('login_via', row['login_via'])
-        if data.get('auth_mode') == 'password':
-            login_via = None
         with self.lock:
-            self.db.execute('UPDATE accounts SET name=?,provider=?,auth_mode=?,encrypted=?,enabled=?,interval_hours=?,next_run=?,login_via=? WHERE id=?',
-                (data['name'], data['provider'], data['auth_mode'], self.encrypt_credentials(old), int(data['enabled']),
+            row = self.account(account_id)
+            if not row:
+                return False
+            if data['provider'] != row['provider']:
+                raise ValueError('已有账号不能更改平台，请单独添加账号')
+            if row['status'] in ('queued', 'running'):
+                raise ValueError('任务运行中，暂不能编辑')
+            old = self.credentials(row)
+            for key in ('email', 'password', 'session', 'api_user'):
+                if data.get(key):
+                    old[key] = data[key]
+            if data.get('auth_mode') == 'session':
+                old = {'session': old['session'], 'api_user': old['api_user']}
+            elif data.get('auth_mode') == 'password':
+                old = {k: old[k] for k in ('email', 'password') if old.get(k)}
+            login_via = data.get('login_via', row['login_via'])
+            if data.get('auth_mode') == 'password':
+                login_via = None
+            self.db.execute('UPDATE accounts SET name=?,auth_mode=?,encrypted=?,enabled=?,interval_hours=?,next_run=?,login_via=? WHERE id=?',
+                (data['name'], data['auth_mode'], self.encrypt_credentials(old), int(data['enabled']),
                  data['interval_hours'], iso(utcnow() + timedelta(hours=data['interval_hours'])), login_via, account_id))
             self.db.commit()
             return True

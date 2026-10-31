@@ -18,6 +18,7 @@ build/pyinstaller-codefuel/
 build/icon.iconset/
 build/*-selftest/
 build/test-*/
+build/ui-platform-login*.png
 build/selftest-data/
 build/dmg-selftest/
 build/node-strip-evaluation

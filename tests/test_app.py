@@ -269,7 +269,7 @@ def test_login_flow_single_window_and_cancel(client, monkeypatch):
     assert client.get(f'/api/login/{session_id}').json()['status'] in ('starting', 'waiting')
     second = client.post('/api/login/start', json={'provider': 'anyrouter', 'method': 'linuxdo', 'name': 'ar'},
                          headers=client.write_headers)
-    assert second.status_code == 400
+    assert second.status_code == 409
     assert client.post(f'/api/login/{session_id}/cancel', json={}, headers=client.write_headers).json()['ok'] is True
     assert client.get(f'/api/login/{session_id}').json()['status'] == 'cancelled'
     assert client.get('/api/login/unknown-session').status_code == 404
@@ -296,7 +296,7 @@ async def test_oauth_relogin_refreshes_existing_account(db):
     from backend.login_flow import LoginFlow, LoginSession
     account_id = db.add_account(account(auth_mode='session', session='old-session', api_user='7', login_via='github'))
     flow = LoginFlow(db)
-    session = LoginSession('agentrouter', 'linuxdo', '主账号', account_id=account_id)
+    session = LoginSession('anyrouter', 'linuxdo', '主账号', account_id=account_id)
     await flow._persist(session, {'id': 7, 'quota': 250000, 'used_quota': 0}, 'new-session')
     row = db.account(account_id)
     assert row['login_via'] == 'linuxdo'
@@ -331,13 +331,18 @@ def test_old_database_gains_login_via_column(tmp_path):
         provider TEXT NOT NULL, status TEXT NOT NULL, trigger_type TEXT NOT NULL, started_at TEXT NOT NULL,
         finished_at TEXT, before_balance REAL, after_balance REAL, reward REAL, message TEXT, duration_ms INTEGER);
         CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);""")
+    encrypted = Fernet(key_path.read_bytes()).encrypt(json.dumps({'session': 'legacy-session', 'api_user': '7'}).encode()).decode()
+    legacy.execute('INSERT INTO accounts (name,provider,auth_mode,encrypted,created_at) VALUES(?,?,?,?,?)',
+                   ('旧账号', 'anyrouter', 'session', encrypted, iso()))
     legacy.commit()
     legacy.close()
     migrated = Store(db_path, key_path)
     try:
         columns = {row['name'] for row in migrated.db.execute('PRAGMA table_info(accounts)')}
         assert 'login_via' in columns
-        assert migrated.dashboard()['accounts'] == []
+        assert migrated.dashboard()['accounts'][0]['name'] == '旧账号'
+        assert migrated.dashboard()['accounts'][0]['login_via'] is None
+        assert migrated.credentials(migrated.account(1)) == {'session': 'legacy-session', 'api_user': '7'}
     finally:
         migrated.close()
 
@@ -352,3 +357,470 @@ def test_switching_to_password_clears_oauth_origin(db):
     account_id = db.add_account(account(auth_mode='session', session='s', api_user='9', login_via='linuxdo'))
     db.update_account(account_id, account(auth_mode='password'))
     assert db.account(account_id)['login_via'] is None
+
+
+def test_bootstrap_provider_registry(client):
+    from backend import engine, providers
+    assert engine.PROVIDERS is providers.PROVIDERS
+    catalog = client.get('/api/bootstrap').json()['providers']
+    assert {p['id'] for p in catalog} == set(providers.PROVIDERS)
+    for entry in catalog:
+        assert entry['name']
+        assert entry['login_methods'] == ['github', 'linuxdo', 'manual', 'password', 'session']
+        assert entry['oauth_availability'] == 'detect_on_login'
+
+
+@pytest.mark.parametrize('provider', ['anyrouter', 'agentrouter'])
+@pytest.mark.parametrize('method', ['github', 'linuxdo', 'manual', 'password', 'session'])
+def test_all_registered_provider_login_methods(client, monkeypatch, provider, method):
+    async def stub_run(self, session):
+        session.status = 'waiting'
+    monkeypatch.setattr(main.login_flow.__class__, '_run', stub_run)
+    if method in ('password', 'session'):
+        response = client.post('/api/accounts', headers=client.write_headers,
+                               json=account(provider=provider, auth_mode=method, session='test-session', api_user='7'))
+        assert response.status_code == 201
+    else:
+        response = client.post('/api/login/start', headers=client.write_headers,
+                               json={'provider': provider, 'method': method, 'name': '测试身份'})
+        assert response.status_code == 202
+        view = client.get('/api/login/' + response.json()['id']).json()
+        assert (view['provider'], view['method']) == (provider, method)
+
+
+def test_validators_follow_registry_not_fixed_names(monkeypatch):
+    from backend.providers import PROVIDERS, Provider
+    monkeypatch.setitem(PROVIDERS, 'isolated-test', Provider(name='isolated-test', domain='https://adapter.test'))
+    assert main.AccountIn(**account(provider='isolated-test')).provider == 'isolated-test'
+    assert main.LoginIn(provider='isolated-test', method='github').provider == 'isolated-test'
+    monkeypatch.setattr(PROVIDERS['isolated-test'], 'login_methods', ('session',))
+    with pytest.raises(ValueError):
+        main.LoginIn(provider='isolated-test', method='github')
+    with pytest.raises(ValueError):
+        main.AccountIn(**account(provider='isolated-test'))
+
+
+@pytest.mark.parametrize('provider', ['anyrouter', 'agentrouter'])
+@pytest.mark.parametrize('method', ['github', 'linuxdo', 'manual'])
+@pytest.mark.asyncio
+async def test_browser_source_labels_and_independent_accounts(db, provider, method):
+    from backend.login_flow import LoginFlow, LoginSession
+    flow = LoginFlow(db)
+    first = LoginSession(provider, method, '相同备注')
+    second = LoginSession(provider, method, '相同备注')
+    await flow._persist(first, {'id': 12}, 'first-isolated-cookie')
+    await flow._persist(second, {'id': 13}, 'second-isolated-cookie')
+    assert first.status == second.status == 'success'
+    assert first.account != second.account
+    assert db.account(first.account)['login_via'] == method
+    assert db.account(second.account)['provider'] == provider
+    assert db.credentials(db.account(first.account)) == {'session': 'first-isolated-cookie', 'api_user': '12'}
+    assert db.credentials(db.account(second.account)) == {'session': 'second-isolated-cookie', 'api_user': '13'}
+
+
+def test_edit_provider_returns_conflict_without_modifying_credentials(client):
+    account_id = client.post('/api/accounts', json=account(), headers=client.write_headers).json()['id']
+    before = dict(main.store.account(account_id))
+    response = client.put(f'/api/accounts/{account_id}', json={'provider': 'agentrouter'}, headers=client.write_headers)
+    assert response.status_code == 409
+    assert dict(main.store.account(account_id)) == before
+
+
+def test_store_edit_cannot_change_provider(db):
+    account_id = db.add_account(account())
+    with pytest.raises(ValueError, match='平台'):
+        db.update_account(account_id, account(provider='agentrouter'))
+    assert db.account(account_id)['provider'] == 'anyrouter'
+
+
+@pytest.mark.parametrize('reason,expected', [('missing', 404), ('provider', 409), ('queued', 409), ('running', 409)])
+def test_relogin_rejects_missing_mismatched_or_busy_account(client, reason, expected):
+    account_id = main.store.add_account(account())
+    if reason == 'missing':
+        main.store.delete_account(account_id)
+    if reason in ('queued', 'running'):
+        main.store.patch(account_id, status=reason)
+    provider = 'agentrouter' if reason == 'provider' else 'anyrouter'
+    response = client.post('/api/login/start', headers=client.write_headers,
+                           json={'provider': provider, 'method': 'github', 'account_id': account_id})
+    assert response.status_code == expected
+    assert not main.login_flow.sessions
+
+
+@pytest.mark.parametrize('busy_set', ['queued', 'active'])
+def test_relogin_checks_in_memory_jobs(client, busy_set):
+    account_id = main.store.add_account(account())
+    getattr(main, busy_set).add(account_id)
+    response = client.post('/api/login/start', headers=client.write_headers,
+                           json={'provider': 'anyrouter', 'method': 'github', 'account_id': account_id})
+    assert response.status_code == 409
+
+
+def test_authorizing_blocks_edit_delete_run_and_second_login(client, monkeypatch):
+    async def stub_run(self, session):
+        session.status = 'waiting'
+    monkeypatch.setattr(main.login_flow.__class__, '_run', stub_run)
+    account_id = main.store.add_account(account())
+    payload = {'provider': 'anyrouter', 'method': 'github', 'account_id': account_id}
+    started = client.post('/api/login/start', headers=client.write_headers, json=payload)
+    assert started.status_code == 202
+    assert client.put(f'/api/accounts/{account_id}', headers=client.write_headers, json={'name': '变更'}).status_code == 409
+    assert client.delete(f'/api/accounts/{account_id}', headers=client.write_headers).status_code == 409
+    assert client.post(f'/api/accounts/{account_id}/run', headers=client.write_headers, json={}).status_code == 409
+    assert client.post('/api/run-all', headers=client.write_headers, json={}).json()['queued'] == 0
+    assert client.post('/api/login/start', headers=client.write_headers, json=payload).status_code == 409
+    client.post('/api/login/' + started.json()['id'] + '/cancel', headers=client.write_headers, json={})
+    assert client.put(f'/api/accounts/{account_id}', headers=client.write_headers, json={'name': '变更'}).status_code == 200
+
+
+@pytest.mark.parametrize('reason', ['missing', 'provider', 'queued', 'running', 'identity'])
+@pytest.mark.asyncio
+async def test_relogin_rechecks_before_persist(db, reason):
+    from backend.login_flow import LoginFlow, LoginSession
+    account_id = db.add_account(account(auth_mode='session', session='old', api_user='7'))
+    flow = LoginFlow(db)
+    session = LoginSession('anyrouter', 'github', '测试', account_id=account_id)
+    if reason == 'missing':
+        db.delete_account(account_id)
+    elif reason == 'provider':
+        db.patch(account_id, provider='agentrouter')
+    elif reason in ('queued', 'running'):
+        db.patch(account_id, status=reason)
+    await flow._persist(session, {'id': 8 if reason == 'identity' else 7}, 'new')
+    assert session.status == 'failed'
+    row = db.account(account_id)
+    if row:
+        assert db.credentials(row)['session'] == 'old'
+    else:
+        assert db.accounts() == []
+
+
+@pytest.mark.parametrize('existing', [False, True])
+@pytest.mark.parametrize('terminal', ['cancelled', 'failed', 'unavailable', 'expired'])
+@pytest.mark.asyncio
+async def test_cancelled_or_failed_login_never_saves(db, existing, terminal):
+    from backend.login_flow import LoginFlow, LoginSession
+    account_id = db.add_account(account(auth_mode='session', session='old', api_user='7')) if existing else None
+    flow = LoginFlow(db)
+    session = LoginSession('anyrouter', 'github', '测试', account_id=account_id)
+    session.status = terminal
+    session.cancelled = terminal == 'cancelled'
+    await flow._persist(session, {'id': 7}, 'new')
+    assert session.status == terminal
+    if existing:
+        assert db.credentials(db.account(account_id))['session'] == 'old'
+    else:
+        assert db.accounts() == []
+
+
+@pytest.mark.parametrize('provider', ['anyrouter', 'agentrouter'])
+@pytest.mark.parametrize('method', ['github', 'linuxdo'])
+@pytest.mark.asyncio
+async def test_missing_oauth_entry_is_unavailable_without_fallback(db, monkeypatch, provider, method):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    import backend.login_flow as login
+    page = SimpleNamespace(url=login.PROVIDERS[provider].domain + '/login', goto=AsyncMock())
+    context = SimpleNamespace(new_page=AsyncMock(return_value=page), pages=[page])
+    browser = SimpleNamespace(new_context=AsyncMock(return_value=context), close=AsyncMock())
+    monkeypatch.setattr(login, 'launch_async', AsyncMock(return_value=browser))
+    monkeypatch.setattr(login, 'prepare_browser_page', AsyncMock())
+    monkeypatch.setattr(login, 'wait_for_waf_ready', AsyncMock())
+    flow = login.LoginFlow(db)
+    monkeypatch.setattr(flow, '_click_oauth', AsyncMock(return_value=False))
+    verify = AsyncMock()
+    monkeypatch.setattr(login, 'verify_target_profile', verify)
+    session = login.LoginSession(provider, method, '测试')
+    await flow._run(session)
+    assert session.status == 'unavailable'
+    assert login.OAUTH_LABELS[method] in session.message
+    assert '未提供' in session.message
+    assert not verify.called
+    assert db.accounts() == []
+    browser.close.assert_awaited_once()
+
+
+@pytest.mark.parametrize('domain,accepted', [
+    ('anyrouter.top', True), ('.anyrouter.top', True), ('router.top', False),
+    ('.router.top', False), ('agentrouter.org', False), ('github.com', False),
+    ('anyrouter.top.other.test', False), ('', False),
+])
+@pytest.mark.asyncio
+async def test_target_cookie_domain_isolation(db, domain, accepted):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from backend.login_flow import LoginFlow
+    from backend.providers import PROVIDERS
+    cookies = AsyncMock(return_value=[{'name': 'session', 'domain': domain, 'value': 'test-cookie', 'path': '/'}])
+    result = await LoginFlow(db)._session_cookie(SimpleNamespace(cookies=cookies), PROVIDERS['anyrouter'])
+    assert result == ('test-cookie' if accepted else None)
+    cookies.assert_awaited_once_with(['https://anyrouter.top/api/user/self'])
+
+
+@pytest.mark.asyncio
+async def test_cookie_filter_does_not_reuse_other_platform_session(db):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from backend.login_flow import LoginFlow
+    from backend.providers import PROVIDERS
+    cookies = AsyncMock(return_value=[
+        {'name': 'session', 'domain': '.github.com', 'value': 'upstream'},
+        {'name': 'session', 'domain': '.agentrouter.org', 'value': 'agent'},
+        {'name': 'session', 'domain': '.anyrouter.top', 'value': 'any'},
+    ])
+    flow = LoginFlow(db)
+    context = SimpleNamespace(cookies=cookies)
+    assert await flow._session_cookie(context, PROVIDERS['anyrouter']) == 'any'
+    assert await flow._session_cookie(context, PROVIDERS['agentrouter']) == 'agent'
+
+
+@pytest.mark.parametrize('page_url,response_url,accepted', [
+    ('https://anyrouter.top/console', 'https://anyrouter.top/api/user/self?fresh=1', True),
+    ('https://github.com/console', 'https://anyrouter.top/api/user/self', False),
+    ('https://anyrouter.top/console', 'https://agentrouter.org/api/user/self', False),
+    ('https://anyrouter.top/console', 'https://anyrouter.top/api/user/self/old', False),
+    ('https://anyrouter.top/console', 'http://anyrouter.top/api/user/self', False),
+])
+@pytest.mark.asyncio
+async def test_profile_verification_requires_target_origin_and_path(page_url, response_url, accepted):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from backend.login_flow import verify_target_profile
+    from backend.providers import PROVIDERS
+    evaluate = AsyncMock(return_value={'status': 200, 'url': response_url, 'body': {'success': True, 'data': {'id': 7}}})
+    profile = await verify_target_profile(SimpleNamespace(url=page_url, evaluate=evaluate), PROVIDERS['anyrouter'])
+    assert bool(profile) is accepted
+    if 'github.com' in page_url:
+        evaluate.assert_not_called()
+    else:
+        script, args = evaluate.call_args.args
+        assert "cache: 'no-store'" in script
+        assert "redirect: 'error'" in script
+        assert "credentials: 'same-origin'" in script
+        assert args['url'] == 'https://anyrouter.top/api/user/self'
+        assert args['nonce']
+
+
+@pytest.mark.asyncio
+async def test_profile_does_not_reuse_previous_success():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from backend.login_flow import verify_target_profile
+    from backend.providers import PROVIDERS
+    page = SimpleNamespace(url='https://anyrouter.top/console', evaluate=AsyncMock(side_effect=[
+        {'status': 200, 'url': 'https://anyrouter.top/api/user/self', 'body': {'success': True, 'data': {'id': 7}}},
+        {'status': 401, 'url': 'https://anyrouter.top/api/user/self', 'body': {'success': False}},
+    ]))
+    assert await verify_target_profile(page, PROVIDERS['anyrouter']) == {'id': 7}
+    assert await verify_target_profile(page, PROVIDERS['anyrouter']) is None
+
+
+def test_editing_api_user_clears_oauth_source(client):
+    account_id = main.store.add_account(account(auth_mode='session', session='old', api_user='7', login_via='github'))
+    response = client.put(f'/api/accounts/{account_id}', json={'api_user': '8'}, headers=client.write_headers)
+    assert response.status_code == 200
+    assert main.store.account(account_id)['login_via'] == 'cookie'
+
+
+def test_legacy_session_without_source_stays_compatible(db):
+    account_id = db.add_account(account(auth_mode='session', session='legacy', api_user='7'))
+    row = db.account(account_id)
+    assert db.public_account(row)['login_via'] is None
+    db.update_account(account_id, account(name='旧账号', auth_mode='session', session='legacy', api_user='7'))
+    assert db.account(account_id)['login_via'] is None
+    assert db.credentials(db.account(account_id)) == {'session': 'legacy', 'api_user': '7'}
+
+
+@pytest.mark.parametrize('role', ['button', 'link'])
+@pytest.mark.parametrize('method', ['github', 'linuxdo'])
+@pytest.mark.asyncio
+async def test_oauth_uses_only_matching_site_entry(db, role, method):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+    from backend.login_flow import LoginFlow, OAUTH_BUTTONS
+    from backend.providers import PROVIDERS
+    button = SimpleNamespace(is_visible=AsyncMock(return_value=True), is_enabled=AsyncMock(return_value=True),
+                             click=AsyncMock(), get_attribute=AsyncMock(return_value=f'/api/oauth/{method}'))
+    found = SimpleNamespace(count=AsyncMock(return_value=1), nth=Mock(return_value=button))
+    absent = SimpleNamespace(count=AsyncMock(return_value=0))
+    def locate(actual_role, name):
+        return found if actual_role == role and name == OAUTH_BUTTONS[method] else absent
+    page = SimpleNamespace(url='https://anyrouter.top/login', get_by_role=locate)
+    assert await LoginFlow(db)._click_oauth(None, page, method, PROVIDERS['anyrouter']) is True
+    button.click.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_profile_verification_closes_browser_without_saving(db, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    import backend.login_flow as login
+    reached = asyncio.Event()
+    page = SimpleNamespace(url='https://anyrouter.top/console', goto=AsyncMock())
+    context = SimpleNamespace(new_page=AsyncMock(return_value=page), pages=[page])
+    browser = SimpleNamespace(new_context=AsyncMock(return_value=context), close=AsyncMock())
+    monkeypatch.setattr(login, 'launch_async', AsyncMock(return_value=browser))
+    monkeypatch.setattr(login, 'prepare_browser_page', AsyncMock())
+    monkeypatch.setattr(login, 'wait_for_waf_ready', AsyncMock())
+    async def pending_profile(*args):
+        reached.set()
+        await asyncio.Event().wait()
+    monkeypatch.setattr(login, 'verify_target_profile', pending_profile)
+    flow = login.LoginFlow(db)
+    monkeypatch.setattr(flow, '_session_cookie', AsyncMock(return_value='isolated-cookie'))
+    session = flow.start('anyrouter', 'manual', '测试')
+    await asyncio.wait_for(reached.wait(), 2)
+    assert session.status == 'verifying'
+    assert flow.cancel(session.id)
+    await asyncio.gather(session.task, return_exceptions=True)
+    assert session.status == 'cancelled'
+    assert db.accounts() == []
+    browser.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_successful_flow_uses_fresh_profile_and_isolated_session(db, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    import backend.login_flow as login
+    page = SimpleNamespace(url='https://agentrouter.org/console', goto=AsyncMock(), evaluate=AsyncMock(return_value={
+        'status': 200, 'url': 'https://agentrouter.org/api/user/self', 'body': {'success': True, 'data': {'id': 15}}}))
+    context = SimpleNamespace(new_page=AsyncMock(return_value=page), pages=[page], cookies=AsyncMock(return_value=[
+        {'name': 'session', 'domain': '.github.com', 'value': 'never-persist'},
+        {'name': 'session', 'domain': '.agentrouter.org', 'value': 'target-only'},
+    ]))
+    browser = SimpleNamespace(new_context=AsyncMock(return_value=context), close=AsyncMock())
+    monkeypatch.setattr(login, 'launch_async', AsyncMock(return_value=browser))
+    monkeypatch.setattr(login, 'prepare_browser_page', AsyncMock())
+    monkeypatch.setattr(login, 'wait_for_waf_ready', AsyncMock())
+    flow = login.LoginFlow(db)
+    monkeypatch.setattr(flow, '_click_oauth', AsyncMock(return_value=True))
+    session = login.LoginSession('agentrouter', 'github', '测试')
+    await flow._run(session)
+    assert session.status == 'success'
+    assert db.credentials(db.account(session.account)) == {'session': 'target-only', 'api_user': '15'}
+    assert db.account(session.account)['login_via'] == 'github'
+    browser.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_serial_windows_wait_until_previous_window_closed(db, monkeypatch):
+    from backend.login_flow import LoginFlow, LoginSession
+    flow = LoginFlow(db)
+    entered = []
+    first_started = asyncio.Event()
+    first_closed = asyncio.Event()
+    async def fake_window(session):
+        entered.append(session.id)
+        if len(entered) == 1:
+            first_started.set()
+            await first_closed.wait()
+    monkeypatch.setattr(flow, '_run_window', fake_window)
+    first = LoginSession('anyrouter', 'manual', '一')
+    second = LoginSession('agentrouter', 'manual', '二')
+    first_task = asyncio.create_task(flow._run(first))
+    await first_started.wait()
+    second_task = asyncio.create_task(flow._run(second))
+    await asyncio.sleep(0)
+    assert entered == [first.id]
+    first_closed.set()
+    await asyncio.gather(first_task, second_task)
+    assert entered == [first.id, second.id]
+
+
+@pytest.mark.asyncio
+async def test_stale_relogin_window_does_not_block_same_account(db, monkeypatch):
+    import time
+    from backend.login_flow import LoginFlow, WINDOW_TIMEOUT
+    flow = LoginFlow(db)
+    account_id = db.add_account(account())
+    async def waiting(session):
+        session.status = 'waiting'
+    monkeypatch.setattr(flow, '_run', waiting)
+    first = flow.start('anyrouter', 'github', None, account_id)
+    await first.task
+    first.created = time.time() - WINDOW_TIMEOUT - 31
+    second = flow.start('anyrouter', 'linuxdo', None, account_id)
+    await second.task
+    assert first.status == 'expired'
+    assert second.status == 'waiting'
+    assert len(db.accounts()) == 1
+
+
+@pytest.mark.parametrize('method,label', [('github', '  continue WITH  GitHub  '),
+                                         ('github', '使用 git hub 继续'),
+                                         ('linuxdo', '使用 Linux DO 登录'),
+                                         ('linuxdo', 'SIGN IN WITH linuxdo')])
+def test_oauth_entry_label_normalization(method, label):
+    from backend.login_flow import OAUTH_BUTTONS
+    assert OAUTH_BUTTONS[method].fullmatch(label)
+    assert not OAUTH_BUTTONS[method].fullmatch(label.strip() + ' 帮助')
+
+
+@pytest.mark.asyncio
+async def test_oauth_entry_waits_for_react_render(db, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+    import backend.login_flow as login
+    ticks = iter([0, 0, 1])
+    monkeypatch.setattr(login, 'time', SimpleNamespace(monotonic=lambda: next(ticks)))
+    button = SimpleNamespace(is_visible=AsyncMock(return_value=True), is_enabled=AsyncMock(return_value=True), click=AsyncMock())
+    found = SimpleNamespace(count=AsyncMock(side_effect=[0, 1]), nth=Mock(return_value=button))
+    absent = SimpleNamespace(count=AsyncMock(return_value=0))
+    page = SimpleNamespace(url='https://anyrouter.top/login',
+                           get_by_role=lambda role, name: found if role == 'button' else absent)
+    assert await login.LoginFlow(db)._click_oauth(None, page, 'github', login.PROVIDERS['anyrouter'])
+    assert found.count.await_count == 2
+    button.click.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_oauth_entry_does_not_click_same_name_help_link(db, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+    import backend.login_flow as login
+    ticks = iter([0, 0, login.OAUTH_ENTRY_TIMEOUT + 1])
+    monkeypatch.setattr(login, 'time', SimpleNamespace(monotonic=lambda: next(ticks)))
+    link = SimpleNamespace(is_visible=AsyncMock(return_value=True), is_enabled=AsyncMock(return_value=True),
+                           get_attribute=AsyncMock(return_value='https://github.com/help'), click=AsyncMock())
+    found = SimpleNamespace(count=AsyncMock(return_value=1), nth=Mock(return_value=link))
+    absent = SimpleNamespace(count=AsyncMock(return_value=0))
+    page = SimpleNamespace(url='https://anyrouter.top/login',
+                           get_by_role=lambda role, name: found if role == 'link' else absent)
+    assert not await login.LoginFlow(db)._click_oauth(None, page, 'github', login.PROVIDERS['anyrouter'])
+    link.click.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_oauth_entry_stops_when_page_leaves_target(db):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from backend.login_flow import LoginFlow
+    from backend.providers import PROVIDERS
+    locate = Mock()
+    page = SimpleNamespace(url='https://github.com/login', get_by_role=locate)
+    assert not await LoginFlow(db)._click_oauth(None, page, 'github', PROVIDERS['anyrouter'])
+    locate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_relogin_updates_metadata_only_after_identity_verified(db):
+    from backend.login_flow import LoginFlow, LoginSession
+    account_id = db.add_account(account(auth_mode='session', session='old', api_user='7', enabled=False))
+    flow = LoginFlow(db)
+    rejected = LoginSession('anyrouter', 'github', '不应保存', account_id, interval_hours=24)
+    await flow._persist(rejected, {'id': 8}, 'rejected')
+    row = db.account(account_id)
+    assert rejected.status == 'failed'
+    assert row['name'] == '主账号'
+    assert row['interval_hours'] == 6
+    accepted = LoginSession('anyrouter', 'github', '新备注', account_id, interval_hours=12)
+    await flow._persist(accepted, {'id': 7}, 'accepted')
+    row = db.account(account_id)
+    assert accepted.status == 'success'
+    assert row['name'] == '新备注'
+    assert row['interval_hours'] == 12
+    assert row['enabled'] == 0
+    assert row['next_run'] > iso(utcnow() + timedelta(hours=11))
+    assert db.credentials(row)['session'] == 'accepted'
+    assert '新备注' in accepted.message

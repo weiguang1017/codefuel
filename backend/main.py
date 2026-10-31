@@ -12,7 +12,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator, model_validator
 from .store import Store, utcnow, iso
 from .engine import CheckinEngine, browser_available
-from .login_flow import LoginFlow
+from .login_flow import LoginFlow, LoginConflict
+from .providers import PROVIDERS, BROWSER_METHODS, CREDENTIAL_METHODS, provider_catalog, supports
 from .paths import APP_NAME, APP_VERSION, resource_root
 
 ROOT = resource_root()
@@ -42,9 +43,9 @@ class AccountIn(BaseModel):
 
     @model_validator(mode='after')
     def validate_account(self):
-        if self.provider not in ('anyrouter', 'agentrouter'):
-            raise ValueError('仅支持 AnyRouter 与 AgentRouter')
-        if self.auth_mode not in ('password', 'session'):
+        if self.provider not in PROVIDERS:
+            raise ValueError('未支持的平台')
+        if self.auth_mode not in CREDENTIAL_METHODS or not supports(self.provider, self.auth_mode):
             raise ValueError('认证方式无效')
         if self.auth_mode == 'password' and (not self.email or not self.password):
             raise ValueError('请填写完整的邮箱和密码')
@@ -63,7 +64,7 @@ class LoginIn(BaseModel):
     method: str = 'github'
     name: str | None = Field(default=None, max_length=40)
     interval_hours: int = Field(default=6, ge=1, le=168)
-    account_id: int | None = None
+    account_id: int | None = Field(default=None, ge=1)
 
     @field_validator('name')
     @classmethod
@@ -72,9 +73,9 @@ class LoginIn(BaseModel):
 
     @model_validator(mode='after')
     def validate_login(self):
-        if self.provider not in ('anyrouter', 'agentrouter'):
-            raise ValueError('仅支持 AnyRouter 与 AgentRouter')
-        if self.method not in ('github', 'linuxdo', 'manual'):
+        if self.provider not in PROVIDERS:
+            raise ValueError('未支持的平台')
+        if self.method not in BROWSER_METHODS or not supports(self.provider, self.method):
             raise ValueError('登录方式无效')
         return self
 
@@ -89,6 +90,7 @@ async def lifespan(app):
         await task
     except asyncio.CancelledError:
         pass
+    await login_flow.close()
     store.close()
 
 
@@ -131,15 +133,16 @@ async def scheduler():
 
 
 def enqueue(account_id, trigger):
-    if account_id in queued or account_id in active:
-        return False
-    row = store.account(account_id)
-    if not row or (trigger == 'scheduled' and not row['enabled']):
-        return False
-    queued.add(account_id)
-    store.patch(account_id, status='queued', last_message='已加入签到队列')
-    asyncio.create_task(execute(account_id, trigger))
-    return True
+    with store.lock:
+        if account_id in queued or account_id in active or login_flow.is_authorizing(account_id):
+            return False
+        row = store.account(account_id)
+        if not row or row['status'] in ('queued', 'running') or (trigger == 'scheduled' and not row['enabled']):
+            return False
+        queued.add(account_id)
+        store.patch(account_id, status='queued', last_message='已加入签到队列')
+        asyncio.create_task(execute(account_id, trigger))
+        return True
 
 
 async def execute(account_id, trigger):
@@ -159,15 +162,23 @@ async def execute(account_id, trigger):
 @app.get('/api/bootstrap')
 def bootstrap():
     available = browser_available()
-    return {**store.dashboard(), 'csrf_token': CSRF,
+    return {**store.dashboard(), 'csrf_token': CSRF, 'providers': provider_catalog(),
             'engine': {'status': 'ready' if available else 'browser_required', 'version': APP_VERSION,
-                       'browser_available': available, 'login_methods': ['github', 'linuxdo', 'password', 'session']}}
+                       'browser_available': available,
+                       'login_methods': list(BROWSER_METHODS + CREDENTIAL_METHODS)}}
 
 
 @app.post('/api/login/start', status_code=202)
 async def start_login(data: LoginIn):
     try:
-        session = login_flow.start(data.provider, data.method, data.name, data.account_id, data.interval_hours)
+        with store.lock:
+            if data.account_id in queued or data.account_id in active:
+                raise LoginConflict('账号正在排队或运行，暂不能重新授权')
+            session = login_flow.start(data.provider, data.method, data.name, data.account_id, data.interval_hours)
+    except LookupError as error:
+        raise HTTPException(404, str(error))
+    except LoginConflict as error:
+        raise HTTPException(409, str(error))
     except (ValueError, RuntimeError) as error:
         raise HTTPException(400, str(error))
     return {'id': session.id, 'status': session.status}
@@ -182,7 +193,7 @@ def login_status(session_id: str):
 
 
 @app.post('/api/login/{session_id}/cancel')
-def cancel_login(session_id: str):
+async def cancel_login(session_id: str):
     return {'ok': login_flow.cancel(session_id)}
 
 
@@ -198,45 +209,51 @@ def create_account(data: AccountIn):
 
 @app.put('/api/accounts/{account_id}')
 def update_account(account_id: int, request: Request, data: dict):
-    row = store.account(account_id)
-    if not row:
-        raise HTTPException(404, '账号不存在')
-    if account_id in active or account_id in queued:
-        raise HTTPException(409, '任务运行中，暂不能编辑')
-    # Merge placeholders with existing credentials without ever returning them.
-    old = store.credentials(row)
-    merged = {'name': data.get('name', row['name']), 'provider': data.get('provider', row['provider']),
-              'auth_mode': data.get('auth_mode', row['auth_mode']), 'enabled': data.get('enabled', bool(row['enabled'])),
-              'interval_hours': data.get('interval_hours', row['interval_hours']), **old}
-    if data.get('password'):
-        merged['password'] = data['password']
-    if data.get('session'):
-        merged['session'] = data['session']
-    if data.get('email'):
-        merged['email'] = data['email']
-    if data.get('api_user'):
-        merged['api_user'] = data['api_user']
-    valid = AccountIn(**merged)
-    payload = valid.model_dump()
-    if data.get('session') and valid.auth_mode == 'session':
-        payload['login_via'] = 'cookie'
-    store.update_account(account_id, payload)
-    return {'ok': True}
+    with store.lock:
+        row = store.account(account_id)
+        if not row:
+            raise HTTPException(404, '账号不存在')
+        if data.get('provider', row['provider']) != row['provider']:
+            raise HTTPException(409, '已有账号不能更改平台，请单独添加账号')
+        if (account_id in active or account_id in queued or row['status'] in ('queued', 'running')
+                or login_flow.is_authorizing(account_id)):
+            raise HTTPException(409, '账号正在排队、运行或授权，暂不能编辑')
+        # 空凭据沿用原值，但不将解密结果返回给客户端。
+        old = store.credentials(row)
+        merged = {'name': data.get('name', row['name']), 'provider': row['provider'],
+                  'auth_mode': data.get('auth_mode', row['auth_mode']), 'enabled': data.get('enabled', bool(row['enabled'])),
+                  'interval_hours': data.get('interval_hours', row['interval_hours']), **old}
+        for key in ('password', 'session', 'email', 'api_user'):
+            if data.get(key):
+                merged[key] = data[key]
+        try:
+            valid = AccountIn(**merged)
+        except ValueError:
+            raise HTTPException(422, '账号信息不完整或格式无效')
+        payload = valid.model_dump()
+        if (data.get('session') or data.get('api_user')) and valid.auth_mode == 'session':
+            payload['login_via'] = 'cookie'
+        store.update_account(account_id, payload)
+        return {'ok': True}
 
 
 @app.delete('/api/accounts/{account_id}')
 def delete_account(account_id: int):
-    if not store.delete_account(account_id):
-        raise HTTPException(409, '账号不存在或正在执行任务')
-    return {'ok': True}
+    with store.lock:
+        if (account_id in active or account_id in queued or login_flow.is_authorizing(account_id)
+                or not store.delete_account(account_id)):
+            raise HTTPException(409, '账号不存在或正在排队、执行任务、授权')
+        return {'ok': True}
 
 
 @app.post('/api/accounts/{account_id}/run', status_code=202)
 async def run_account(account_id: int):
     if not store.account(account_id):
         raise HTTPException(404, '账号不存在')
+    if login_flow.is_authorizing(account_id):
+        raise HTTPException(409, '该账号正在授权，暂不能运行任务')
     if not enqueue(account_id, 'manual'):
-        return {'queued': False, 'message': '该账号已在队列中'}
+        return {'queued': False, 'message': '该账号已在队列、运行或授权中'}
     return {'queued': True}
 
 

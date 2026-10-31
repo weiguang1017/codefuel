@@ -7,7 +7,8 @@ import time
 from pathlib import Path
 import httpx
 
-from .upstream_imports import ProviderConfig, login_with_credentials, prepare_browser_page, wait_for_waf_ready
+from .providers import PROVIDERS
+from .upstream_imports import login_with_credentials, prepare_browser_page, wait_for_waf_ready
 
 
 def _local_chrome():
@@ -23,12 +24,6 @@ def _local_chrome():
 
 from cloakbrowser import launch_async  # noqa: E402
 
-PROVIDERS = {
-    'anyrouter': ProviderConfig(name='anyrouter', domain='https://anyrouter.top',
-        bypass_method='waf_cookies', waf_cookie_names=['acw_tc', 'cdn_sec_tc', 'acw_sc__v2'], persist_profile=False),
-    'agentrouter': ProviderConfig(name='agentrouter', domain='https://agentrouter.org',
-        sign_in_path=None, bypass_method='waf_cookies', waf_cookie_names=['acw_tc'], use_proxy=False, persist_profile=False),
-}
 LOCAL_CHROME = _local_chrome()
 if LOCAL_CHROME and not os.getenv('CLOAKBROWSER_BINARY_PATH'):
     os.environ['CLOAKBROWSER_BINARY_PATH'] = LOCAL_CHROME

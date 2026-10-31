@@ -4,14 +4,22 @@ import json
 import os
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 from playwright.async_api import async_playwright
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-SHOT = ROOT / 'tests/.tmp'
+DATA_DIR = os.getenv('CODEFUEL_DATA_DIR')
+BASE_URL = os.getenv('CODEFUEL_TEST_URL')
+if not DATA_DIR or not BASE_URL:
+    raise RuntimeError('界面测试必须显式设置 CODEFUEL_DATA_DIR 和 CODEFUEL_TEST_URL，禁止使用真实默认数据与服务。')
+if not Path(DATA_DIR).is_absolute() or Path(DATA_DIR).resolve() == (ROOT / 'data').resolve():
+    raise RuntimeError('CODEFUEL_DATA_DIR 必须是隔离测试目录的绝对路径，不能指向项目真实 data。')
+if urlparse(BASE_URL).hostname != '127.0.0.1' or urlparse(BASE_URL).scheme != 'http':
+    raise RuntimeError('CODEFUEL_TEST_URL 必须指向显式启动的 127.0.0.1 隔离测试服务。')
+SHOT = ROOT / 'build/test-platform-login'
 SHOT.mkdir(parents=True, exist_ok=True)
-BASE_URL = os.getenv('CODEFUEL_TEST_URL', 'http://127.0.0.1:8765')
 PREFIX = '界面验证'
 
 
@@ -44,6 +52,22 @@ async def main():
         page.on('pageerror', lambda err: errors.append(str(err)))
         page.on('console', lambda msg: errors.append(msg.text) if msg.type == 'error' else None)
         await page.goto(BASE_URL, wait_until='networkidle')
+        await page.evaluate("""async () => {
+          const data = await (await fetch('/api/bootstrap')).json();
+          const response = await fetch('/api/settings', {method:'PATCH', headers:{'Content-Type':'application/json','X-CSRF-Token':data.csrf_token},
+            body:JSON.stringify({scheduler_enabled:false,interval_hours:data.settings.interval_hours})});
+          if(!response.ok) throw new Error('测试前关闭调度器失败');
+          const confirmed = await (await fetch('/api/bootstrap')).json();
+          if(confirmed.settings.scheduler_enabled) throw new Error('调度器仍启用，拒绝写入测试账号');
+        }""")
+        from backend.store import Store
+        store = Store()
+        try:
+            if store.settings()['scheduler_enabled']:
+                raise RuntimeError('浏览器服务与 CODEFUEL_DATA_DIR 未确认一致或调度器仍开启，停止测试。')
+        finally:
+            store.close()
+        await page.reload(wait_until='networkidle')
         assert '码粮 CodeFuel' in await page.title()
         assert 'CodeFuel' in await page.locator('.brand').inner_text()
         assert await page.locator('#page-title').inner_text() == '为代码添粮，让灵感续航。'
@@ -65,7 +89,7 @@ async def main():
         assert await page.locator('.login-method').count() == 2
         assert '使用 GitHub 继续' in await page.locator('.login-method').nth(0).inner_text()
         assert '使用 LinuxDO 继续' in await page.locator('.login-method').nth(1).inner_text()
-        assert await page.locator('#account-submit').inner_text() == '打开授权窗口'
+        assert await page.locator('#account-submit').inner_text() == '开始逐平台授权（1）'
         await page.screenshot(path=str(SHOT / 'login-methods.png'))
         await page.locator('[data-method="linuxdo"]').click()
         assert 'LinuxDO 授权登录' in await page.locator('.auth-hint').inner_text()

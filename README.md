@@ -23,6 +23,21 @@
 - **本地优先**：只监听 `127.0.0.1`，凭据用 Fernet 加密后落在本机 SQLite，不上传任何服务器。
 - **可追溯**：每次执行留存站点真实响应摘要，日志可导出 CSV（已做公式注入防护）。
 
+## 同一个身份，连接多个平台
+
+GitHub 和 LinuxDO 是登录身份，不绑定某一个签到平台。同一个身份可以分别登录所有**已适配、且实际提供对应登录入口**的平台；目前已适配 AnyRouter 与 AgentRouter。
+
+1. 添加账号时先选择「使用 GitHub 继续」或「使用 LinuxDO 继续」，再勾选一个或多个目标平台。
+2. 码粮按选择顺序打开各平台的授权窗口；请在每个窗口使用你希望关联的同一个身份完成授权。
+3. 每成功连接一个平台，账号列表中都会新增一条该平台的独立账号记录，可分别签到、查看余额和重新授权。
+4. 已有 GitHub / LinuxDO 授权账号可通过「连接其他平台」继续添加平台，不必重复填写备注与登录方式。
+
+**会话不跨站复用**：每个平台签发的 Cookie、站内用户 ID 均独立加密保存，不复制给其他平台，也不会仅凭相同备注或登录方式自动合并账号。本应用不保存 GitHub / LinuxDO 的密码或上游登录会话。
+
+如果某个平台未提供对应入口，本次授权会明确提示未完成；你可以重试或跳过该平台继续连接其他平台。取消剩余授权不会删除已成功添加的账号。邮箱密码与手动 Session Cookie 仍一次添加一个平台。
+
+> 平台是否开放 GitHub / LinuxDO 登录，以实际登录页为准；“已适配”不等于保证该平台当前启用所有登录方式。跨平台连接不代表登录一次即可自动获得所有平台的授权或额度。
+
 ## 技术栈
 
 Python 3.11+ · FastAPI · Uvicorn · SQLite · cryptography(Fernet) · Playwright · pywebview · PyInstaller
@@ -57,7 +72,10 @@ uv run desktop.py      # 启动桌面窗口
 uv run desktop.py --selftest          # 仅启动本地服务，不打开窗口
 uv run desktop.py --browser-selftest  # 用本地页面验证浏览器驱动，不联网
 uv run desktop.py --smoke             # 打开真实窗口读取页面后退出
+uv run python tests/ui_platform_login.py  # 多平台授权界面回归：模拟 API，不登录真实站点
 ```
+
+多平台界面回归使用本机 Chrome 和仅监听 `127.0.0.1` 的临时静态服务，覆盖逐平台授权、部分失败、取消、重试与认证方式切换。运行会写入账号的旧版 `tests/ui_check.py` 时，必须显式指定隔离的 `CODEFUEL_DATA_DIR` 与本地测试服务 `CODEFUEL_TEST_URL`，不要指向日常使用的数据或服务。
 
 ## 打包
 

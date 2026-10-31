@@ -38,3 +38,34 @@
 .referral-link:hover{border-color:#cdb185;background:#fffcf5;transform:translateY(-1px)}
 .referral-link svg{width:13px;height:13px;color:#a98b5b}
 @media(max-width:760px){.referral-card{display:none}.referral-banner{flex-wrap:wrap;gap:12px}}
+/* 平台选择与逐平台授权结果 */
+#modal{width:560px;max-width:calc(100vw - 28px);max-height:calc(100dvh - 28px);overflow-y:auto}
+#modal-content{min-width:0}
+#modal .modal-head>div{min-width:0}
+#modal .modal-head p,#modal .notice,.field-help{overflow-wrap:anywhere}
+#modal .segmented{display:flex;flex-wrap:wrap}
+#modal .segmented button{flex:1;min-width:110px}
+.field-help{margin:8px 0 0;color:#7a8780;font-size:11px;line-height:1.65}
+.platform-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:9px}
+.platform-heading label{margin-bottom:0}
+.platform-heading .panel-link{font-size:11px;white-space:normal;text-align:right}
+.platform-options{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.platform-option{display:flex!important;align-items:center;gap:10px;padding:12px;border:1px solid var(--line);border-radius:9px;cursor:pointer;margin:0!important;min-width:0}
+.platform-option:has(input:checked){background:#f1f7f2;border-color:#85ac91}
+.platform-option input{width:16px!important;height:16px!important;flex:none;accent-color:var(--green);margin:0}
+.platform-option span{min-width:0;overflow-wrap:anywhere}
+.platform-option b{display:block;font-size:12px;color:#314b3b}
+.platform-option small{display:block;font-size:10px;color:#849187;font-weight:400;margin-top:2px}
+.platform-progress{list-style:none;padding:0;margin:0 0 20px;display:grid;gap:10px}
+.platform-progress li{padding:12px 14px;border:1px solid var(--line);border-radius:8px;background:#fafbfa}
+.platform-progress li.current{border-color:#aac2af;background:#f5f9f5}
+.platform-progress li>div{display:flex;gap:12px;justify-content:space-between;font-size:12px}
+.platform-progress li span{color:#849187;white-space:nowrap}
+.platform-progress li p{font-size:11px;line-height:1.6;margin:5px 0 0;color:#758279;overflow-wrap:anywhere}
+.platform-progress .success span{color:#39744a}
+.platform-progress .error span,.platform-progress .network span,.platform-progress .unknown span{color:#a36537}
+#modal .modal-actions{flex-wrap:wrap;gap:8px}
+#modal .modal-actions .field-help{flex-basis:100%;text-align:right}
+#modal select:disabled{color:#526157;opacity:1;background:#f2f4f2;cursor:not-allowed}
+.toolbar,.filter-group{flex-wrap:wrap}
+@media(max-width:480px){.platform-options{grid-template-columns:1fr}.platform-heading{align-items:flex-start}.platform-heading .panel-link{max-width:125px}.platform-progress li>div{flex-wrap:wrap}.referral-banner-links{flex-wrap:wrap}.heading-actions{flex-wrap:wrap}}
