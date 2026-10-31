@@ -147,7 +147,10 @@ jobs:
           find artifacts -maxdepth 2 -type f -printf '%s\t%p\n' | sort -k2
           mkdir -p release
           # 按文件类型收拢，不用通配符 cp，避免静默失败。
-          find artifacts -type f \( -name '*.dmg' -o -name '*.zip' -o -name '*.exe' \) \
+          # 只发布安装器；Windows 便携版的内部文件（node.exe 等）不能单独上传。
+          find artifacts/macos-installer -type f \( -name '*.dmg' -o -name '*.zip' \) \
+            -exec cp -v {} release/ \;
+          find artifacts/windows-installer -maxdepth 1 -type f -name '*setup.exe' \
             -exec cp -v {} release/ \;
           # Windows 便携目录单独压成 zip，避免 Release 里出现上千个散文件。
           if [ -d artifacts/windows-installer/CodeFuel ]; then
@@ -158,7 +161,10 @@ jobs:
           ls -lh release
           # 一个产物都没有就让整个任务失败，绝不发布空 Release。
           compgen -G "release/*.dmg" > /dev/null || { echo "缺少 macOS dmg" >&2; exit 1; }
-          compgen -G "release/*.exe" > /dev/null || { echo "缺少 Windows 安装程序" >&2; exit 1; }
+          compgen -G "release/*setup.exe" > /dev/null || { echo "缺少 Windows 安装程序" >&2; exit 1; }
+          # 发布文件数量必须精简，避免把内部可执行文件散出去。
+          COUNT=$(find release -maxdepth 1 -type f | wc -l)
+          [ "$COUNT" -le 4 ] || { echo "发布文件过多（$COUNT 个），请检查收集规则" >&2; exit 1; }
 
       - name: 创建 Release
         uses: softprops/action-gh-release@v2
@@ -192,5 +198,6 @@ jobs:
             - 账号凭据用 Fernet 加密后保存在本机，不会上传。
           files: |
             release/*.dmg
-            release/*.zip
-            release/*.exe
+            release/CodeFuel-macOS-*.zip
+            release/CodeFuel-*-setup.exe
+            release/CodeFuel-Windows-portable-*.zip
