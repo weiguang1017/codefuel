@@ -48,6 +48,18 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.tag || github.ref }}
+      # 手动重发保留标签源码，只从本次工作流提交取 DMG 打包脚本。
+      - name: 获取本次工作流的打包工具
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          path: .release-tools
+          sparse-checkout: build/make_dmg.sh
+          sparse-checkout-cone-mode: false
+      - name: 应用修正的 DMG 打包工具
+        if: github.event_name == 'workflow_dispatch'
+        run: cp .release-tools/build/make_dmg.sh build/make_dmg.sh
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true

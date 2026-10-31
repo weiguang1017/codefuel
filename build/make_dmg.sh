@@ -24,9 +24,12 @@ VOLUME="CodeFuel"   # 固定卷名：AppleScript 用 disk "CodeFuel" 定位，�
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/codefuel-dmg.XXXXXX")"
 RW="$(mktemp -u "${TMPDIR:-/tmp}/codefuel-rw.XXXXXX").dmg"
 MNT="/Volumes/$VOLUME"
+MOUNTED=0
 
 cleanup() {
-  hdiutil detach "$MNT" -quiet >/dev/null 2>&1 || true
+  if [[ "$MOUNTED" == "1" ]]; then
+    hdiutil detach "$MNT" -quiet >/dev/null 2>&1 || true
+  fi
   rm -rf "$STAGE" "$RW"
 }
 trap cleanup EXIT
@@ -34,11 +37,23 @@ trap cleanup EXIT
 ditto "$APP" "$STAGE/CodeFuel.app"
 ln -s /Applications "$STAGE/Applications"
 
+# CI 不需要 Finder 排版，直接从暂存目录生成只读压缩镜像。
+# 不挂载镜像，避免无图形会话中卷被占用导致 detach/convert 失败。
+if [[ "$SKIP_LAYOUT" == "1" ]]; then
+  echo "无界面打包：直接生成压缩 DMG，不挂载镜像。"
+  hdiutil create -srcfolder "$STAGE" -volname "$VOLUME" -fs HFS+ \
+    -format UDZO -imagekey zlib-level=9 "$OUT"
+  hdiutil verify "$OUT"
+  du -sh "$OUT"
+  exit 0
+fi
+
 # 额外留 32 MiB 给 HFS+ 和 Finder 元数据。
 SIZE_KB=$(( $(du -sk "$STAGE" | cut -f1) + 32768 ))
 hdiutil create -quiet -srcfolder "$STAGE" -volname "$VOLUME" -fs HFS+ \
   -format UDRW -size "${SIZE_KB}k" "$RW"
-hdiutil attach "$RW" -mountpoint "$MNT" -noautoopen -quiet
+hdiutil attach "$RW" -mountpoint "$MNT" -noautoopen
+MOUNTED=1
 
 # 只是视觉排版；显式跳过或没有图形会话时不做，DMG 仍完全可用。
 if [[ "$SKIP_LAYOUT" == "1" ]]; then
@@ -71,8 +86,9 @@ else
 fi
 
 sync
-hdiutil detach "$MNT" -quiet
-hdiutil convert "$RW" -format UDZO -imagekey zlib-level=9 -o "$OUT" -quiet
+hdiutil detach "$MNT"
+MOUNTED=0
+hdiutil convert "$RW" -format UDZO -imagekey zlib-level=9 -o "$OUT"
 
 echo
 echo "已完成：$OUT"
