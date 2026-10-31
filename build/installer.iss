@@ -38,11 +38,38 @@ PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 
 [Languages]
-Name: "chinese"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+; 只用 Inno Setup 自带的英文语言文件：官方安装包不含简体中文 .isl，
+; 额外下载会让 CI 依赖外网且不可复现。界面文案已用中文写在下面各段。
 Name: "english"; MessagesFile: "compiler:Default.isl"
+
+[Messages]
+english.WelcomeLabel1=欢迎安装 [name]
+english.WelcomeLabel2=即将把 [name] 安装到你的电脑。%n%n这是本地桌面应用，账号凭据加密保存在本机，不会上传。%n%n继续前请关闭正在运行的 CodeFuel。
+english.FinishedHeadingLabel=[name] 安装完成
+english.FinishedLabelNoIcons=[name] 已安装完成，可以直接启动。
+english.FinishedLabel=[name] 已安装完成。勾选下面的选项即可立即启动。
+english.SelectDirLabel3=选择安装位置，然后点「下一步」继续。
+english.SelectStartMenuFolderLabel3=选择开始菜单文件夹名称。
+english.SelectTasksLabel2=选择附加任务，然后点「下一步」继续。
+english.ReadyLabel1=准备就绪，即将开始安装。
+english.ReadyLabel2a=点「安装」开始安装 [name]。
+english.ClickInstallToContinue=点「安装」开始安装。
+english.ConfirmUninstall=确定要卸载 [name] 吗？%n%n账号数据保存在用户目录下，不会随卸载删除。
+english.UninstalledAll=[name] 已卸载完成。
+english.ButtonNext=下一步(&N) >
+english.ButtonBack=< 上一步(&B)
+english.ButtonInstall=安装(&I)
+english.ButtonCancel=取消
+english.ButtonFinish=完成(&F)
+english.ButtonBrowse=B 浏览…
+english.ButtonNo=否(&N)
+english.ButtonYes=是(&Y)
 
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加任务:"; Flags: unchecked
+
+[CustomMessages]
+LaunchApp=立即启动 码粮 CodeFuel
 
 [Files]
 ; 整个 PyInstaller 目录都要带上，Node 驱动和 .dll 缺一不可。
