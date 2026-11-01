@@ -19,8 +19,8 @@ from .paths import APP_NAME, APP_VERSION, resource_root
 ROOT = resource_root()
 CSRF = secrets.token_urlsafe(24)
 store = Store()
-engine = CheckinEngine()
 login_flow = LoginFlow(store)
+engine = CheckinEngine()
 queued = set()
 active = set()
 
@@ -190,6 +190,13 @@ def login_status(session_id: str):
     if not view:
         raise HTTPException(404, '授权会话不存在或已过期')
     return view
+
+
+@app.post('/api/login/{session_id}/resume')
+async def resume_login(session_id: str):
+    if not login_flow.resume_verification(session_id):
+        raise HTTPException(409, '当前授权不在等待人工处理状态，请查询最新进度。')
+    return {'ok': True, **login_flow.view(session_id)}
 
 
 @app.post('/api/login/{session_id}/cancel')

@@ -1,6 +1,8 @@
 import asyncio
 import json
 from datetime import timedelta
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 import pytest
 from fastapi.testclient import TestClient
 from backend.store import Store, utcnow, iso
@@ -87,6 +89,39 @@ def account(**kw):
             'interval_hours': 6, **kw}
 
 
+class FakeContext:
+    """Playwright context 的最小替身：支持响应监听器的注册与移除。"""
+    def __init__(self, pages=None, cookies=None):
+        self.pages = list(pages or [])
+        self.listeners = {}
+        self.add_cookies = AsyncMockSideEffect('新登录窗口不得导入旧站点 cookie')
+        self.cookies = cookies if cookies is not None else AsyncMockDefaultList()
+
+    async def new_page(self):
+        page = self.pages[0]
+        if page not in self.pages:
+            self.pages.append(page)
+        return page
+
+    def on(self, event, handler):
+        self.listeners.setdefault(event, []).append(handler)
+
+    def remove_listener(self, event, handler):
+        self.listeners[event].remove(handler)
+
+
+class AsyncMockDefaultList:
+    """未显式配置 cookies 时返回空列表，避免伪造目标站点会话。"""
+    async def __call__(self, *args, **kwargs):
+        return []
+
+
+class AsyncMockSideEffect(AsyncMock):
+    """被调用即失败的替身：用于断言某能力绝不被使用。"""
+    def __init__(self, reason):
+        super().__init__(side_effect=AssertionError(reason))
+
+
 def test_credentials_encrypted_and_never_public(db):
     account_id = db.add_account(account())
     raw = db.db_path.read_bytes()
@@ -169,8 +204,9 @@ async def test_agentrouter_observes_change_without_signin_request(db, monkeypatc
     monkeypatch.setattr(adapter, 'BrowserSession', FakeSession)
     result = await adapter.CheckinEngine().run(db.account(account_id), {'email': 'a', 'password': 'b'}, True)
     assert result['status'] == 'synced'
-    assert result['reward'] == 25
+    assert result['reward'] is None
     assert '观察值' in result['message']
+    assert '不记为签到奖励' in result['message']
 
 
 @pytest.mark.asyncio
@@ -225,11 +261,65 @@ async def test_browser_session_primes_site_before_account_session(monkeypatch):
     assert [event[0] for event in events] == [
         'launch', 'new_context', 'new_page', 'prepare', 'goto', 'cookies', 'goto', 'close',
     ]
+    assert events[0][1] == {'headless': True}
     assert events[4][1] == 'https://anyrouter.top'
     assert events[4][2] == 60_000
     assert events[5] == ('cookies', ['session'])
     assert events[6][1] == 'https://anyrouter.top/login'
     assert events[6][2] == 60_000
+
+
+@pytest.mark.asyncio
+async def test_agentrouter_background_session_uses_proxy_and_skips_login_spa(monkeypatch):
+    import backend.engine as adapter
+    from backend.providers import PROVIDERS
+
+    events = []
+
+    class FakePage:
+        url = 'https://agentrouter.org'
+
+        async def goto(self, url, **kwargs):
+            events.append(('goto', url))
+
+        async def wait_for_load_state(self, *args, **kwargs):
+            return None
+
+    class FakeContext:
+        async def new_page(self):
+            events.append(('new_page',))
+            return FakePage()
+
+        async def add_cookies(self, cookies):
+            events.append(('cookies', [cookie['name'] for cookie in cookies]))
+
+    class FakeBrowser:
+        async def new_context(self):
+            events.append(('new_context',))
+            return FakeContext()
+
+        async def close(self):
+            events.append(('close',))
+
+    launch_calls = []
+
+    async def fake_launch(**kwargs):
+        launch_calls.append(kwargs)
+        return FakeBrowser()
+
+    monkeypatch.setattr(adapter, 'get_playwright_proxy', lambda *, use_proxy: (
+        {'server': 'http://127.0.0.1:7890'} if use_proxy else None))
+    monkeypatch.setattr(adapter, 'launch_async', fake_launch)
+    monkeypatch.setattr(adapter, 'prepare_browser_page', AsyncMock())
+
+    async with adapter.BrowserSession(PROVIDERS['agentrouter'], {'session': 'saved-session'}):
+        pass
+
+    assert launch_calls == [{'headless': True, 'proxy': {'server': 'http://127.0.0.1:7890'}}]
+    assert events == [
+        ('new_context',), ('new_page',), ('goto', 'https://agentrouter.org'),
+        ('cookies', ['session']), ('close',),
+    ]
 
 
 @pytest.mark.asyncio
@@ -779,7 +869,7 @@ async def test_missing_oauth_entry_is_unavailable_without_fallback(db, monkeypat
     from unittest.mock import AsyncMock
     import backend.login_flow as login
     page = SimpleNamespace(url=login.PROVIDERS[provider].domain + '/login', goto=AsyncMock())
-    context = SimpleNamespace(new_page=AsyncMock(return_value=page), pages=[page])
+    context = FakeContext([page])
     browser = SimpleNamespace(new_context=AsyncMock(return_value=context), close=AsyncMock())
     monkeypatch.setattr(login, 'launch_async', AsyncMock(return_value=browser))
     monkeypatch.setattr(login, 'prepare_browser_page', AsyncMock())
@@ -916,7 +1006,7 @@ async def test_cancel_during_profile_verification_closes_browser_without_saving(
     import backend.login_flow as login
     reached = asyncio.Event()
     page = SimpleNamespace(url='https://anyrouter.top/console', goto=AsyncMock())
-    context = SimpleNamespace(new_page=AsyncMock(return_value=page), pages=[page])
+    context = FakeContext([page])
     browser = SimpleNamespace(new_context=AsyncMock(return_value=context), close=AsyncMock())
     monkeypatch.setattr(login, 'launch_async', AsyncMock(return_value=browser))
     monkeypatch.setattr(login, 'prepare_browser_page', AsyncMock())
@@ -944,7 +1034,7 @@ async def test_successful_flow_uses_fresh_profile_and_isolated_session(db, monke
     import backend.login_flow as login
     page = SimpleNamespace(url='https://agentrouter.org/console', goto=AsyncMock(), evaluate=AsyncMock(return_value={
         'status': 200, 'url': 'https://agentrouter.org/api/user/self', 'body': {'success': True, 'data': {'id': 15}}}))
-    context = SimpleNamespace(new_page=AsyncMock(return_value=page), pages=[page], cookies=AsyncMock(return_value=[
+    context = FakeContext([page], cookies=AsyncMock(return_value=[
         {'name': 'session', 'domain': '.github.com', 'value': 'never-persist'},
         {'name': 'session', 'domain': '.agentrouter.org', 'value': 'target-only'},
     ]))
@@ -1008,7 +1098,9 @@ async def test_stale_relogin_window_does_not_block_same_account(db, monkeypatch)
 
 @pytest.mark.parametrize('method,label', [('github', '  continue WITH  GitHub  '),
                                          ('github', '使用 git hub 继续'),
+                                         ('github', 'github_logo 使用 GitHub 继续'),
                                          ('linuxdo', '使用 Linux DO 登录'),
+                                         ('linuxdo', 'linuxdo_logo 使用 LinuxDO 继续'),
                                          ('linuxdo', 'SIGN IN WITH linuxdo')])
 def test_oauth_entry_label_normalization(method, label):
     from backend.login_flow import OAUTH_BUTTONS
@@ -1197,3 +1289,1056 @@ async def test_unrelated_links_are_not_registration_navigation(db, monkeypatch, 
     page = SimpleNamespace(url='https://anyrouter.top/login', get_by_role=Mock(return_value=links))
     assert not await login.LoginFlow(db)._navigate_login_link(page, login.PROVIDERS['anyrouter'], '/login', '/register')
     link.click.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_agentrouter_session_checkin_uses_saved_session_in_background(db, monkeypatch):
+    """AgentRouter 与 Anyrouter 一样复用已保存会话，不为签到打开交互窗口。"""
+    from unittest.mock import AsyncMock
+    import backend.engine as adapter
+
+    account_id = db.add_account(account(provider='agentrouter', auth_mode='session',
+                                       email=None, password=None, session='stored-session', api_user='7'))
+    db.patch(account_id, has_snapshot=1, balance=1, used_quota=0, total_quota=100)
+    row = db.account(account_id)
+    credentials = db.credentials(row)
+    before = dict(row)
+    calls = []
+
+    class FakeSession:
+        def __init__(self, provider, cookies):
+            calls.append(('open', provider.name, cookies))
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def request(self, path, user, method='GET', payload=None):
+            calls.append(('request', path, user, method, payload))
+            return {'status': 200, 'body': {'success': True, 'data': {
+                'id': 7, 'quota': 62500000, 'used_quota': 0,
+            }}}
+
+    monkeypatch.setattr(adapter, 'BrowserSession', FakeSession)
+    password_login = AsyncMock(side_effect=AssertionError('Session 账号不应使用密码登录'))
+    monkeypatch.setattr(adapter, 'login_with_credentials', password_login)
+
+    result = await adapter.CheckinEngine().run(row, credentials, True)
+
+    assert result['duration_ms'] >= 0
+    assert dict(db.account(account_id)) == before
+    assert db.credentials(db.account(account_id)) == credentials
+    password_login.assert_not_awaited()
+    assert calls == [
+        ('open', 'agentrouter', {'session': 'stored-session'}),
+        ('request', '/api/user/self', '7', 'GET', None),
+    ]
+    assert result['status'] == 'synced'
+    assert result['before_balance'] == result['after_balance'] == 125
+    assert result['total_quota'] == 125
+    assert result.get('reward') is None
+    assert '$25.00' in result['message']
+    assert '不记为签到奖励' in result['message']
+    assert '_session_update' not in result
+
+
+@pytest.mark.asyncio
+async def test_agentrouter_expired_session_requires_reauthorization_without_popup(db, monkeypatch):
+    import backend.engine as adapter
+
+    account_id = db.add_account(account(provider='agentrouter', auth_mode='session',
+                                       email=None, password=None, session='s', api_user='7'))
+    row = db.account(account_id)
+    calls = []
+
+    class FakeSession:
+        def __init__(self, _provider, _cookies):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def request(self, path, user, method='GET', payload=None):
+            calls.append((path, user, method))
+            return {'status': 401, 'body': {'success': False}}
+
+    monkeypatch.setattr(adapter, 'BrowserSession', FakeSession)
+
+    result = await adapter.CheckinEngine().run(row, db.credentials(row), False)
+
+    assert calls == [('/api/user/self', '7', 'GET')]
+    assert result['status'] == 'manual_required'
+    assert '重新授权' in result['message']
+    assert result.get('reward') is None
+    assert '_session_update' not in result
+
+
+@pytest.mark.asyncio
+async def test_agentrouter_first_login_without_snapshot_has_no_reward(db, monkeypatch):
+    import backend.engine as adapter
+
+    account_id = db.add_account(account(provider='agentrouter', auth_mode='session',
+                                       email=None, password=None, session='s', api_user='7'))
+    row = db.account(account_id)
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def request(self, path, user, method='GET', payload=None):
+            assert path == '/api/user/self'
+            assert user == '7'
+            return {'status': 200, 'body': {'success': True, 'data': {
+                'id': 7, 'quota': 57500000, 'used_quota': 5000000,
+            }}}
+
+    monkeypatch.setattr(adapter, 'BrowserSession', lambda *args: FakeSession())
+
+    result = await adapter.CheckinEngine().run(row, db.credentials(row), False)
+
+    assert result['status'] == 'synced'
+    assert result['reward'] is None
+    assert result['after_balance'] == 115
+    assert result['total_quota'] == 125
+    assert '不记为签到奖励' in result['message']
+
+
+
+
+@pytest.mark.parametrize('profile_id', [7, 8])
+@pytest.mark.asyncio
+async def test_checkin_login_never_persists_or_imports_old_session(db, monkeypatch, profile_id):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+    import backend.login_flow as login
+
+    account_id = db.add_account(account(provider='agentrouter', auth_mode='session',
+                                       email=None, password=None, session='old-checkin-cookie',
+                                       api_user='7', login_via='github'))
+    row = db.account(account_id)
+    before = dict(row)
+    profile = {'id': profile_id, 'quota': 62500000, 'used_quota': 0}
+    page = SimpleNamespace(url='https://agentrouter.org/console', goto=AsyncMock(),
+                           evaluate=AsyncMock(return_value={'status': 200, 'body': {'success': True},
+                                                            'guarded': False}))
+    context = FakeContext([page], cookies=AsyncMock(return_value=[{'name': 'session', 'domain': '.agentrouter.org',
+                                                                  'path': '/', 'value': 'fresh-checkin-cookie'}]))
+    flow = login.LoginFlow(db)
+    captured = {}
+    async def close_window():
+        session = next(iter(flow.sessions.values()))
+        captured['session'] = session
+        captured['view'] = flow.view(session.id)
+    browser = SimpleNamespace(new_context=AsyncMock(return_value=context), close=AsyncMock(side_effect=close_window))
+    launch = AsyncMock(return_value=browser)
+    monkeypatch.setattr(login, 'launch_async', launch)
+    monkeypatch.setattr(login, 'prepare_browser_page', AsyncMock())
+    monkeypatch.setattr(login, 'wait_for_waf_ready', AsyncMock())
+    verify = AsyncMock(return_value=profile)
+    monkeypatch.setattr(login, 'verify_target_profile', verify)
+    monkeypatch.setattr(flow, '_open_oauth', AsyncMock(return_value=True))
+    persist = AsyncMock(side_effect=AssertionError('签到登录回调不得直接保存账号'))
+    monkeypatch.setattr(flow, '_persist', persist)
+    read_credentials = Mock(side_effect=AssertionError('新登录窗口不得读取旧凭据'))
+    monkeypatch.setattr(db, 'credentials', read_credentials)
+
+    result = await flow.authenticate_for_checkin(row, '7')
+
+    assert result == ({'profile': profile, 'session': 'fresh-checkin-cookie'} if profile_id == 7 else None)
+    assert captured['session'].status == ('success' if profile_id == 7 else 'failed')
+    assert captured['session'].checkin_result is None
+    assert captured['view']['account_id'] == account_id
+    assert not {'session', 'profile', 'checkin_identity', 'checkin_result'} & captured['view'].keys()
+    assert 'fresh-checkin-cookie' not in json.dumps(captured['view'])
+    assert 'old-checkin-cookie' not in json.dumps(captured['view'])
+    assert flow.sessions == {}
+    assert dict(db.account(account_id)) == before
+    persist.assert_not_awaited()
+    read_credentials.assert_not_called()
+    launch.assert_awaited_once_with(headless=False)
+    browser.new_context.assert_awaited_once_with(viewport=None)
+    context.add_cookies.assert_not_awaited()
+    verify.assert_awaited_once_with(page, login.PROVIDERS['agentrouter'])
+    browser.close.assert_awaited_once()
+
+
+@pytest.mark.parametrize('login_via,method', [('github', 'github'), ('linuxdo', 'linuxdo'),
+                                            ('manual', 'manual'), ('cookie', 'manual'), (None, 'manual')])
+@pytest.mark.asyncio
+async def test_checkin_login_callback_can_use_isolated_window_result(db, monkeypatch, login_via, method):
+    from unittest.mock import AsyncMock
+    from backend.login_flow import LoginFlow
+
+    account_id = db.add_account(account(provider='agentrouter', auth_mode='session',
+                                       session='old', api_user='7', login_via=login_via))
+    flow = LoginFlow(db)
+    captured = {}
+    fresh = {'profile': {'id': 7}, 'session': 'callback-only-cookie'}
+    async def isolated_window(session):
+        captured['session'] = session
+        assert session.method == method
+        assert session.checkin_identity == '7'
+        assert flow.is_authorizing(account_id)
+        session.checkin_result = fresh
+        session.status = 'success'
+        view = flow.view(session.id)
+        assert 'callback-only-cookie' not in json.dumps(view)
+        assert 'checkin_result' not in view
+    window = AsyncMock(side_effect=isolated_window)
+    monkeypatch.setattr(flow, '_run_window', window)
+    persist = AsyncMock()
+    monkeypatch.setattr(flow, '_persist', persist)
+
+    assert await flow.authenticate_for_checkin(db.account(account_id), 7) == fresh
+    window.assert_awaited_once()
+    persist.assert_not_awaited()
+    assert captured['session'].checkin_result is None
+    assert flow.sessions == {}
+    assert not flow.is_authorizing(account_id)
+    assert db.credentials(db.account(account_id))['session'] == 'old'
+
+
+@pytest.mark.asyncio
+async def test_execute_preserves_saved_session_after_checkin(db, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    account_id = db.add_account(account(provider='agentrouter', auth_mode='session',
+                                       email=None, password=None, session='old-execute-cookie', api_user='7'))
+    result = {'status': 'synced', 'message': '隔离回归结果', 'duration_ms': 1,
+              'before_balance': 100, 'after_balance': 125, 'total_quota': 125,
+              'used_quota': 0, 'reward': None}
+    run = AsyncMock(return_value=result)
+    monkeypatch.setattr(main, 'store', db)
+    monkeypatch.setattr(main, 'engine', SimpleNamespace(run=run))
+    monkeypatch.setattr(main, 'queued', {account_id})
+    monkeypatch.setattr(main, 'active', set())
+    finish = Mock(wraps=db.finish_run)
+    monkeypatch.setattr(db, 'finish_run', finish)
+
+    await main.execute(account_id, 'manual')
+
+    run.assert_awaited_once()
+    assert db.credentials(db.account(account_id)) == {'session': 'old-execute-cookie', 'api_user': '7'}
+    assert '_session_update' not in finish.call_args.args[2]
+    assert db.account(account_id)['status'] == 'synced'
+    assert db.runs()[0]['reward'] is None
+    assert db.dashboard()['stats']['today_reward'] == 0
+    assert not main.queued
+    assert not main.active
+
+
+@pytest.fixture
+def isolated_profile_window(db, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    import backend.login_flow as login
+
+    response_url = 'https://anyrouter.top/api/user/self'
+    page = SimpleNamespace(url='https://anyrouter.top/console', goto=AsyncMock(), evaluate=AsyncMock())
+    context = FakeContext([page], cookies=AsyncMock(return_value=[
+        {'name': 'session', 'domain': '.anyrouter.top', 'path': '/', 'value': 'isolated-profile-cookie'},
+    ]))
+    browser = SimpleNamespace(new_context=AsyncMock(return_value=context), close=AsyncMock())
+    monkeypatch.setattr(login, 'launch_async', AsyncMock(return_value=browser))
+    monkeypatch.setattr(login, 'prepare_browser_page', AsyncMock())
+    monkeypatch.setattr(login, 'wait_for_waf_ready', AsyncMock())
+    async def yield_loop(*args):
+        await asyncio.sleep(0)
+    delay = AsyncMock(side_effect=yield_loop)
+    monkeypatch.setattr(login, 'asyncio', SimpleNamespace(**{**vars(asyncio), 'sleep': delay}))
+    flow = login.LoginFlow(db)
+    session = login.LoginSession('anyrouter', 'manual', '隔离身份校验')
+    flow.sessions[session.id] = session
+    flow.active_id = session.id
+    pauses = asyncio.Queue()
+    wait_resume = session.resume_event.wait
+    async def observed_wait():
+        pauses.put_nowait(None)
+        return await wait_resume()
+    session.resume_event.wait = AsyncMock(side_effect=observed_wait)
+    persist = AsyncMock(wraps=flow._persist)
+    monkeypatch.setattr(flow, '_persist', persist)
+    return SimpleNamespace(flow=flow, session=session, page=page, context=context, browser=browser,
+                           response_url=response_url, pauses=pauses, persist=persist, delay=delay,
+                           prepare_page=login.prepare_browser_page, wait_ready=login.wait_for_waf_ready)
+
+
+@pytest.mark.parametrize('method', ['manual', 'github', 'linuxdo'])
+@pytest.mark.asyncio
+async def test_interactive_authorization_does_not_dismiss_dialogs(isolated_profile_window, method, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    window = isolated_profile_window
+    window.session.method = method
+    window.page.evaluate.return_value = {
+        'status': 200, 'url': window.response_url, 'body': {'success': True, 'data': {'id': 31}},
+    }
+    monkeypatch.setattr(window.flow, '_open_oauth', AsyncMock(return_value=True))
+
+    await asyncio.wait_for(window.flow._run(window.session), 2)
+
+    assert window.session.status == 'success'
+    window.page.goto.assert_awaited_once()
+    window.prepare_page.assert_not_called()
+    window.wait_ready.assert_not_called()
+    window.browser.close.assert_awaited_once()
+
+
+@pytest.mark.parametrize('status,non_json', [(200, True), (403, False), (429, False)])
+@pytest.mark.asyncio
+async def test_profile_response_requiring_manual_attention_is_not_success(status, non_json):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from backend.login_flow import ProfileVerificationBlocked, verify_target_profile
+    from backend.providers import PROVIDERS
+
+    page = SimpleNamespace(url='https://anyrouter.top/console', evaluate=AsyncMock(return_value={
+        'status': status, 'url': 'https://anyrouter.top/api/user/self', 'nonJson': non_json,
+        'body': {'success': True, 'data': {'id': 7}},
+    }))
+    with pytest.raises(ProfileVerificationBlocked, match='暂停自动校验'):
+        await verify_target_profile(page, PROVIDERS['anyrouter'])
+    page.evaluate.assert_awaited_once()
+
+
+@pytest.mark.parametrize('status,body,expected', [
+    (200, {'success': True, 'data': {'id': 7, 'username': 'isolated-user'}},
+     {'id': 7, 'username': 'isolated-user'}),
+    (200, {'success': True, 'data': {'id': '7'}}, {'id': '7'}),
+    (200, {'success': False, 'data': {'id': 7}}, None),
+    (401, {'success': False}, None),
+])
+@pytest.mark.asyncio
+async def test_profile_normal_json_response_remains_compatible(status, body, expected):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from backend.login_flow import verify_target_profile
+    from backend.providers import PROVIDERS
+
+    page = SimpleNamespace(url='https://anyrouter.top/console', evaluate=AsyncMock(return_value={
+        'status': status, 'url': 'https://anyrouter.top/api/user/self', 'nonJson': False, 'body': body,
+    }))
+    assert await verify_target_profile(page, PROVIDERS['anyrouter']) == expected
+    page.evaluate.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_non_json_pause_only_saves_after_resumed_fresh_verification(db, isolated_profile_window):
+    window = isolated_profile_window
+    fresh_started = asyncio.Event()
+    fresh_result = asyncio.Event()
+    async def evaluate(script, args):
+        if window.page.evaluate.await_count == 1:
+            return {'status': 200, 'url': window.response_url, 'nonJson': True,
+                    'body': {'success': True, 'data': {'id': 99}}}
+        fresh_started.set()
+        await fresh_result.wait()
+        return {'status': 200, 'url': window.response_url, 'body': {'success': True, 'data': {'id': 17}}}
+    window.page.evaluate.side_effect = evaluate
+    window.session.task = asyncio.create_task(window.flow._run(window.session))
+    try:
+        await asyncio.wait_for(window.pauses.get(), 2)
+        view = window.flow.view(window.session.id)
+        assert view['status'] == 'waiting'
+        assert view['stage'] == 'verification_blocked'
+        assert view['verification_paused'] is True
+        assert view['account_id'] is None
+        assert '暂停自动请求' in view['message']
+        assert 'isolated-profile-cookie' not in json.dumps(view)
+        for _ in range(3):
+            await asyncio.sleep(0)
+            assert window.flow.view(window.session.id)['verification_paused'] is True
+        window.page.evaluate.assert_awaited_once()
+        window.persist.assert_not_awaited()
+        window.browser.close.assert_not_awaited()
+        assert db.accounts() == []
+
+        assert window.flow.resume_verification(window.session.id) is True
+        assert window.flow.resume_verification(window.session.id) is False
+        await asyncio.wait_for(fresh_started.wait(), 2)
+        assert window.session.status == 'verifying'
+        assert window.session.stage == 'verifying_target'
+        assert window.session.verification_paused is False
+        window.persist.assert_not_awaited()
+        assert db.accounts() == []
+        nonces = [call.args[1]['nonce'] for call in window.page.evaluate.await_args_list]
+        assert len(nonces) == len(set(nonces)) == 2
+
+        fresh_result.set()
+        await asyncio.wait_for(window.session.task, 2)
+        assert window.session.status == 'success'
+        window.persist.assert_awaited_once_with(window.session, {'id': 17}, 'isolated-profile-cookie')
+        assert len(db.accounts()) == 1
+        assert db.credentials(db.account(window.session.account)) == {
+            'session': 'isolated-profile-cookie', 'api_user': '17',
+        }
+        window.browser.close.assert_awaited_once()
+    finally:
+        await window.flow.close()
+
+
+@pytest.mark.asyncio
+async def test_resume_with_non_json_response_pauses_again_without_polling(db, isolated_profile_window):
+    window = isolated_profile_window
+    window.page.evaluate.return_value = {'status': 200, 'url': window.response_url, 'nonJson': True}
+    window.session.task = asyncio.create_task(window.flow._run(window.session))
+    try:
+        await asyncio.wait_for(window.pauses.get(), 2)
+        assert window.flow.resume_verification(window.session.id)
+        await asyncio.wait_for(window.pauses.get(), 2)
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert window.page.evaluate.await_count == 2
+        assert window.session.status == 'waiting'
+        assert window.session.stage == 'verification_blocked'
+        assert window.session.verification_paused is True
+        window.persist.assert_not_awaited()
+        assert db.accounts() == []
+    finally:
+        await window.flow.close()
+    window.browser.close.assert_awaited_once()
+
+
+@pytest.mark.parametrize('existing', [False, True])
+@pytest.mark.asyncio
+async def test_cancel_paused_verification_never_saves(db, isolated_profile_window, existing):
+    window = isolated_profile_window
+    if existing:
+        account_id = db.add_account(account(auth_mode='session', session='original-isolated-cookie', api_user='7'))
+        window.session.account_id = window.session.account = account_id
+    before = [dict(row) for row in db.accounts()]
+    window.page.evaluate.return_value = {'status': 200, 'url': window.response_url, 'nonJson': True}
+    window.session.task = asyncio.create_task(window.flow._run(window.session))
+    try:
+        await asyncio.wait_for(window.pauses.get(), 2)
+        assert window.flow.cancel(window.session.id)
+        await asyncio.wait_for(asyncio.gather(window.session.task, return_exceptions=True), 2)
+        assert window.session.status == 'cancelled'
+        assert window.flow.resume_verification(window.session.id) is False
+        window.page.evaluate.assert_awaited_once()
+        window.persist.assert_not_awaited()
+        window.browser.close.assert_awaited_once()
+        assert [dict(row) for row in db.accounts()] == before
+        if existing:
+            assert db.credentials(db.account(account_id))['session'] == 'original-isolated-cookie'
+    finally:
+        await window.flow.close()
+
+
+def test_resume_api_reports_stage_and_accepts_each_pause_only_once(client):
+    from backend.login_flow import LoginSession
+
+    session = LoginSession('anyrouter', 'manual', '隔离恢复接口')
+    session.status = 'waiting'
+    session.stage = 'verification_blocked'
+    session.verification_paused = True
+    main.login_flow.sessions[session.id] = session
+    assert client.get(f'/api/login/{session.id}').json()['verification_paused'] is True
+
+    response = client.post(f'/api/login/{session.id}/resume', json={}, headers=client.write_headers)
+    assert response.status_code == 200
+    body = response.json()
+    assert body['ok'] is True
+    assert body['status'] == 'waiting'
+    assert body['stage'] == 'verification_blocked'
+    assert body['verification_paused'] is False
+    assert body['account_id'] is None
+    assert session.resume_event.is_set()
+    assert not {'resume_event', 'session', 'profile', 'encrypted'} & body.keys()
+    assert client.post(f'/api/login/{session.id}/resume', json={}, headers=client.write_headers).status_code == 409
+    assert main.store.accounts() == []
+
+
+@pytest.mark.parametrize('status,paused', [
+    ('waiting', False), ('verifying', False), ('success', True), ('cancelled', True), ('expired', True),
+])
+def test_resume_api_rejects_sessions_not_waiting_for_manual_action(client, status, paused):
+    from backend.login_flow import LoginSession
+
+    session = LoginSession('anyrouter', 'manual', '隔离无效恢复')
+    session.status = status
+    session.verification_paused = paused
+    main.login_flow.sessions[session.id] = session
+    response = client.post(f'/api/login/{session.id}/resume', json={}, headers=client.write_headers)
+    assert response.status_code == 409
+    assert session.status == status
+    assert session.verification_paused is paused
+    assert not session.resume_event.is_set()
+    assert main.store.accounts() == []
+
+
+def test_resume_api_rejects_unknown_session(client):
+    response = client.post('/api/login/unknown-isolated-session/resume', json={}, headers=client.write_headers)
+    assert response.status_code == 409
+    assert main.store.accounts() == []
+
+
+@pytest.mark.asyncio
+async def test_profile_verification_checks_each_target_tab_before_waiting(db, isolated_profile_window):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    window = isolated_profile_window
+    checked = []
+    async def older_response(*args):
+        checked.append('older')
+        return {'status': 200, 'url': window.response_url, 'body': {'success': True, 'data': {'id': 23}}}
+    async def newer_response(*args):
+        checked.append('newer')
+        return {'status': 401, 'url': window.response_url, 'body': {'success': False}}
+    window.page.evaluate.side_effect = older_response
+    newer_page = SimpleNamespace(url='https://anyrouter.top/login', evaluate=AsyncMock(side_effect=newer_response))
+    window.context.pages.append(newer_page)
+
+    await asyncio.wait_for(window.flow._run(window.session), 2)
+
+    assert checked == ['newer', 'older']
+    assert window.session.status == 'success'
+    window.page.evaluate.assert_awaited_once()
+    newer_page.evaluate.assert_awaited_once()
+    window.delay.assert_not_awaited()
+    window.persist.assert_awaited_once_with(window.session, {'id': 23}, 'isolated-profile-cookie')
+    assert db.credentials(db.account(window.session.account))['api_user'] == '23'
+    window.browser.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_profile_spa_context_navigation_waits_then_verifies_again(db, isolated_profile_window):
+    from playwright.async_api import Error as PlaywrightError
+
+    window = isolated_profile_window
+    waiting = asyncio.Event()
+    continue_navigation = asyncio.Event()
+    window.page.evaluate.side_effect = [
+        PlaywrightError('Page.evaluate: Execution context was destroyed, most likely because of a navigation'),
+        {'status': 200, 'url': window.response_url, 'body': {'success': True, 'data': {'id': 29}}},
+    ]
+    async def wait_navigation(*args):
+        waiting.set()
+        await continue_navigation.wait()
+    window.delay.side_effect = wait_navigation
+    window.session.task = asyncio.create_task(window.flow._run(window.session))
+    try:
+        await asyncio.wait_for(waiting.wait(), 2)
+        view = window.flow.view(window.session.id)
+        assert view['status'] == 'waiting'
+        assert view['stage'] == 'returning_to_target'
+        assert view['verification_paused'] is False
+        window.page.evaluate.assert_awaited_once()
+        window.persist.assert_not_awaited()
+        assert db.accounts() == []
+
+        continue_navigation.set()
+        await asyncio.wait_for(window.session.task, 2)
+        assert window.session.status == 'success'
+        assert window.page.evaluate.await_count == 2
+        window.persist.assert_awaited_once_with(window.session, {'id': 29}, 'isolated-profile-cookie')
+        assert db.credentials(db.account(window.session.account))['api_user'] == '29'
+        window.browser.close.assert_awaited_once()
+    finally:
+        await window.flow.close()
+
+
+# --- LoginEvidence：只认本次独立 context 内、同源、JSON、success 且会话一致的正常响应 ---
+
+class FakeResponse:
+    def __init__(self, url, request, status=200, content_type='application/json', body=None,
+                 set_cookie=(), from_service_worker=False, finished=None):
+        self.url = url
+        self.request = request
+        self.status = status
+        self._content_type = content_type
+        self._body = {'success': True, 'data': {'id': 7}} if body is None else body
+        self._set_cookie = list(set_cookie)
+        self.from_service_worker = from_service_worker
+        self._finished = finished
+
+    async def all_headers(self):
+        return {'content-type': self._content_type}
+
+    async def header_values(self, name):
+        return list(self._set_cookie) if name == 'set-cookie' else []
+
+    async def finished(self):
+        return self._finished
+
+    async def json(self):
+        return self._body
+
+
+class FakeRequest:
+    def __init__(self, url, page, frame_url=None, headers=None):
+        self.url = url
+        self.frame = SimpleNamespace(page=page, url=frame_url or url)
+        self._headers = headers or {}
+
+    async def all_headers(self):
+        return self._headers
+
+
+def make_page(context, url='https://agentrouter.org/console'):
+    return SimpleNamespace(url=url, context=context)
+
+
+async def settle():
+    for _ in range(6):
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('method,path', [
+    ('github', '/api/oauth/github?code=abc&state=xyz&mode=login'),
+    ('linuxdo', '/api/oauth/linuxdo?code=abc&state=xyz&mode=login'),
+    ('manual', '/api/oauth/github?code=abc&state=xyz&mode=login'),
+    ('manual', '/api/oauth/linuxdo?code=abc&state=xyz&mode=login'),
+    ('manual', '/api/user/login'),
+])
+async def test_login_evidence_accepts_own_json_login_response(method, path):
+    from backend.login_flow import LoginEvidence
+    from backend.providers import PROVIDERS
+
+    provider = PROVIDERS['agentrouter']
+    context = FakeContext()
+    page = make_page(context)
+    context.pages = [page]
+    evidence = LoginEvidence(context, provider, method, AsyncMock(return_value='site-cookie'))
+    evidence.start()
+    assert context.listeners['response']
+
+    request = FakeRequest(provider.domain + path, page)
+    response = FakeResponse(provider.domain + path, request,
+                            body={'success': True, 'data': {'id': 7, 'username': 'u', 'quota': 5000000,
+                                                            'used_quota': 0, 'token': 'must-not-leak'}},
+                            set_cookie=['session=site-cookie; Path=/; HttpOnly'])
+    context.listeners['response'][0](response)
+    await evidence.changed.wait()
+    await settle()
+
+    captured = await evidence.get()
+    assert captured == ({'id': 7, 'username': 'u', 'quota': 5000000, 'used_quota': 0}, 'site-cookie')
+    await evidence.close()
+    assert context.listeners['response'] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('case', [
+    'cross_origin', 'wrong_path', 'not_json', 'failed_status', 'success_false',
+    'bind_message', 'bad_id', 'no_code', 'wrong_mode', 'cookie_mismatch',
+    'service_worker', 'aborted', 'foreign_context', 'frame_offsite',
+])
+async def test_login_evidence_rejects_untrusted_responses(case):
+    from backend.login_flow import LoginEvidence
+    from backend.providers import PROVIDERS
+
+    provider = PROVIDERS['agentrouter']
+    context = FakeContext()
+    page = make_page(context)
+    other_page = make_page(FakeContext())
+    context.pages = [page]
+    evidence = LoginEvidence(context, provider, 'github', AsyncMock(return_value='site-cookie'))
+    evidence.start()
+
+    path = '/api/oauth/github?code=abc&state=xyz&mode=login'
+    if case == 'wrong_path':
+        path = '/api/user/login/other'
+    if case == 'no_code':
+        path = '/api/oauth/github?state=xyz&mode=login'
+    if case == 'wrong_mode':
+        path = '/api/oauth/github?code=abc&state=xyz&mode=register'
+    url = ('https://evil.example' + path) if case == 'cross_origin' else provider.domain + path
+    owner = other_page if case == 'foreign_context' else page
+    request = FakeRequest(url, owner, frame_url='https://evil.example/frame' if case == 'frame_offsite' else provider.domain + path)
+    response = FakeResponse(
+        url, request,
+        status=500 if case == 'failed_status' else 200,
+        content_type='text/html' if case == 'not_json' else 'application/json',
+        body={'success': case != 'success_false', 'message': 'bind' if case == 'bind_message' else None,
+              'data': {'id': 'abc' if case == 'bad_id' else 7}},
+        set_cookie=['session=other-cookie'] if case == 'cookie_mismatch' else ['session=site-cookie; Path=/'],
+        from_service_worker=case == 'service_worker',
+        finished='net::ERR_ABORTED' if case == 'aborted' else None,
+    )
+    context.listeners['response'][0](response)
+    await settle()
+
+    assert await evidence.get() is None
+    await evidence.close()
+
+
+@pytest.mark.asyncio
+async def test_login_evidence_invalidates_earlier_login_on_second_attempt():
+    """同一窗口内第二次登录请求必须让上一次的登录证据作废。"""
+    from backend.login_flow import LoginEvidence
+    from backend.providers import PROVIDERS
+
+    provider = PROVIDERS['agentrouter']
+    context = FakeContext()
+    page = make_page(context)
+    context.pages = [page]
+    evidence = LoginEvidence(context, provider, 'github', AsyncMock(return_value='site-cookie'))
+    evidence.start()
+    path = provider.domain + '/api/oauth/github?code=abc&state=xyz&mode=login'
+    handler = context.listeners['response'][0]
+
+    handler(FakeResponse(path, FakeRequest(path, page),
+                         set_cookie=['session=site-cookie; Path=/']))
+    await settle()
+    assert await evidence.get() is not None
+
+    handler(FakeResponse(path, FakeRequest(path, page), status=500, body={'success': False}))
+    await settle()
+    assert await evidence.get() is None
+    await evidence.close()
+
+
+@pytest.mark.asyncio
+async def test_login_evidence_accepts_self_response_matching_current_cookie():
+    from backend.login_flow import LoginEvidence
+    from backend.providers import PROVIDERS
+
+    provider = PROVIDERS['agentrouter']
+    context = FakeContext()
+    page = make_page(context)
+    context.pages = [page]
+    evidence = LoginEvidence(context, provider, 'manual', AsyncMock(return_value='site-cookie'))
+    evidence.start()
+    url = provider.domain + provider.user_info_path
+    request = FakeRequest(url, page, headers={'cookie': 'acw_tc=x; session=site-cookie'})
+    context.listeners['response'][0](FakeResponse(url, request, body={'success': True, 'data': {'id': 9}}))
+    await settle()
+
+    assert await evidence.get() == ({'id': 9}, 'site-cookie')
+    await evidence.close()
+
+
+@pytest.mark.asyncio
+async def test_login_evidence_rejects_self_response_with_stale_cookie():
+    from backend.login_flow import LoginEvidence
+    from backend.providers import PROVIDERS
+
+    provider = PROVIDERS['agentrouter']
+    context = FakeContext()
+    page = make_page(context)
+    context.pages = [page]
+    read_cookie = AsyncMock(return_value='rotated-cookie')
+    evidence = LoginEvidence(context, provider, 'manual', read_cookie)
+    evidence.start()
+    url = provider.domain + provider.user_info_path
+    request = FakeRequest(url, page, headers={'cookie': 'session=old-cookie'})
+    context.listeners['response'][0](FakeResponse(url, request, body={'success': True, 'data': {'id': 9}}))
+    await settle()
+
+    assert await evidence.get() is None
+    await evidence.close()
+
+
+@pytest.mark.asyncio
+async def test_login_evidence_expires_and_requires_target_page():
+    from backend.login_flow import LoginEvidence
+    from backend.providers import PROVIDERS
+
+    provider = PROVIDERS['agentrouter']
+    context = FakeContext()
+    page = make_page(context)
+    context.pages = [page]
+    evidence = LoginEvidence(context, provider, 'manual', AsyncMock(return_value='site-cookie'))
+    evidence.start()
+    url = provider.domain + provider.user_info_path
+    context.listeners['response'][0](FakeResponse(url, FakeRequest(url, page, headers={'cookie': 'session=site-cookie'})))
+    await settle()
+    assert await evidence.get() is not None
+
+    page.url = 'https://github.com/login'
+    assert await evidence.get() is None
+    page.url = provider.domain + '/console'
+    context.pages = []
+    assert await evidence.get() is None
+    await evidence.close()
+
+
+@pytest.mark.asyncio
+async def test_login_evidence_never_retains_raw_auth_payload():
+    from backend.login_flow import LoginEvidence
+    from backend.providers import PROVIDERS
+
+    provider = PROVIDERS['agentrouter']
+    context = FakeContext()
+    page = make_page(context)
+    context.pages = [page]
+    evidence = LoginEvidence(context, provider, 'github', AsyncMock(return_value='site-cookie'))
+    evidence.start()
+    path = provider.domain + '/api/oauth/github?code=secret-code&state=s&mode=login'
+    context.listeners['response'][0](FakeResponse(path, FakeRequest(path, page),
+        body={'success': True, 'data': {'id': 7, 'access_token': 'sk-secret', 'password': 'p'},
+              'session': 'raw-session'},
+        set_cookie=['session=site-cookie; Path=/']))
+    await settle()
+
+    profile, cookie = await evidence.get()
+    assert cookie == 'site-cookie'
+    assert set(profile) <= {'id', 'username', 'quota', 'used_quota', 'checked_in'}
+    await evidence.close()
+
+
+@pytest.mark.parametrize('guarded', [True, False])
+@pytest.mark.asyncio
+async def test_checkin_window_logs_out_before_login(db, monkeypatch, guarded):
+    """签到重登必须在窗口内先退出旧会话；防护页不得被当作退出成功。"""
+    from unittest.mock import AsyncMock
+    import backend.login_flow as login
+
+    account_id = db.add_account(account(provider='agentrouter', auth_mode='session',
+                                       email=None, password=None, session='old', api_user='7',
+                                       login_via='linuxdo'))
+    row = db.account(account_id)
+    before = dict(row)
+    order = []
+    seen = []
+
+    async def evaluate(script, args):
+        url = args.get('url') or ''
+        if url.endswith(login.PROVIDERS['agentrouter'].logout_path):
+            order.append('logout')
+            return {'status': 200, 'body': {'success': True}, 'guarded': guarded}
+        # 签到重登链路里不该再调用被 WAF 拦的账号接口
+        raise AssertionError(f'签到重登不应再发起其他窗口内请求：{url}')
+
+    page = SimpleNamespace(url='https://agentrouter.org/login', goto=AsyncMock(),
+                           evaluate=AsyncMock(side_effect=evaluate))
+    context = FakeContext([page], cookies=AsyncMock(return_value=[
+        {'name': 'session', 'domain': '.agentrouter.org', 'path': '/', 'value': 'fresh'},
+    ]))
+    browser = SimpleNamespace(new_context=AsyncMock(return_value=context), close=AsyncMock())
+    monkeypatch.setattr(login, 'launch_async', AsyncMock(return_value=browser))
+    flow = login.LoginFlow(db)
+
+    # 授权入口一旦被打开，说明「先登出」这一步已经结束；此时直接给出登录身份，
+    # 避免用例依赖真实站点响应、也避免进入 900 秒的等待轮询。
+    async def open_oauth(_context, _page, session, _provider):
+        order.append('login')
+        assert order[0] == 'logout', f'必须先退出旧会话：{order}'
+        # 防护页（guarded）不得被当作退出成功；正常 JSON 才算退出。
+        seen.append(session.stage)
+        session.stage = 'identity_confirmed'
+        session.checkin_result = {'profile': {'id': 7, 'quota': 62500000, 'used_quota': 0},
+                                  'session': 'fresh'}
+        session.status = 'success'
+        return True
+    monkeypatch.setattr(flow, '_open_oauth', open_oauth)
+    persist = AsyncMock(side_effect=AssertionError('签到重登不得写库'))
+    monkeypatch.setattr(flow, '_persist', persist)
+
+    result = await flow.authenticate_for_checkin(row, '7')
+
+    assert seen == (['logging_out'] if guarded else ['logged_out'])
+    assert result == {'profile': {'id': 7, 'quota': 62500000, 'used_quota': 0}, 'session': 'fresh'}
+    persist.assert_not_awaited()
+    assert dict(db.account(account_id)) == before
+
+
+@pytest.mark.asyncio
+async def test_checkin_window_logout_page_is_not_treated_as_logged_out(db, monkeypatch):
+    """防护页返回 200 时不得把 stage 记为 logged_out。"""
+    from unittest.mock import AsyncMock
+    import backend.login_flow as login
+
+    flow = login.LoginFlow(db)
+    page = SimpleNamespace(evaluate=AsyncMock(return_value={'status': 200, 'guarded': True, 'body': None}))
+    session = login.LoginSession('agentrouter', 'linuxdo', '窗口内退出')
+    await flow._logout_in_window(page, session, login.PROVIDERS['agentrouter'])
+    assert session.stage != 'logged_out'
+
+    page.evaluate = AsyncMock(return_value={'status': 200, 'guarded': False, 'body': {'success': True}})
+    await flow._logout_in_window(page, session, login.PROVIDERS['agentrouter'])
+    assert session.stage == 'logged_out'
+
+
+@pytest.mark.asyncio
+async def test_checkin_logout_returns_to_login_page_before_oauth(db, monkeypatch):
+    """实测：退出接口不会让控制台页跳转，登录入口只渲染在登录页。
+
+    若不重新打开登录页，就会被误判成「未提供授权入口」而放弃签到。
+    """
+    from unittest.mock import AsyncMock
+    import backend.login_flow as login
+
+    provider = login.PROVIDERS['agentrouter']
+    account_id = db.add_account(account(provider='agentrouter', auth_mode='session',
+                                        email=None, password=None, session='old', api_user='7',
+                                        login_via='linuxdo'))
+    row = db.account(account_id)
+    visited = []
+
+    def make_page():
+        page = SimpleNamespace(url=f'https://agentrouter.org{provider.login_path}',
+                               goto=AsyncMock(), evaluate=AsyncMock(
+                                   return_value={'status': 200, 'body': {'success': True},
+                                                 'guarded': False}))
+
+        async def goto(url, **_kwargs):
+            page.url = url
+            visited.append(url)
+        page.goto = AsyncMock(side_effect=goto)
+        return page
+
+    page = make_page()
+    context = FakeContext([page], cookies=AsyncMock(return_value=[
+        {'name': 'session', 'domain': '.agentrouter.org', 'path': '/', 'value': 'fresh'},
+    ]))
+    browser = SimpleNamespace(new_context=AsyncMock(return_value=context), close=AsyncMock())
+    monkeypatch.setattr(login, 'launch_async', AsyncMock(return_value=browser))
+    flow = login.LoginFlow(db)
+
+    async def logout(_page, session, p):
+        session.stage = 'logged_out'
+        # 真实站点退出后仍停在控制台，不做前端跳转。
+        _page.url = 'https://agentrouter.org/dashboard'
+
+    monkeypatch.setattr(flow, '_logout_in_window', logout)
+    checked = {}
+
+    async def open_oauth(_context, inner_page, session, _provider):
+        checked['url'] = inner_page.url
+        session.checkin_result = {'profile': {'id': 7, 'quota': 5000000, 'used_quota': 0},
+                                  'session': 'fresh'}
+        session.status = 'success'
+        return True
+
+    monkeypatch.setattr(flow, '_open_oauth', open_oauth)
+
+    result = await flow.authenticate_for_checkin(row, '7')
+
+    assert checked['url'].endswith(provider.login_path), '登出后必须回到登录页再找授权入口'
+    assert result['session'] == 'fresh'
+
+
+@pytest.mark.asyncio
+async def test_window_saves_from_observed_login_response_without_profile_polling(db, monkeypatch):
+    """站点自身返回登录成功 JSON 后立即保存，不再依赖被 WAF 拦截的账号接口。"""
+    from unittest.mock import AsyncMock
+    import backend.login_flow as login
+
+    provider = login.PROVIDERS['agentrouter']
+    page = SimpleNamespace(url=provider.domain + '/console', goto=AsyncMock(), evaluate=AsyncMock())
+    context = FakeContext([page], cookies=AsyncMock(return_value=[
+        {'name': 'session', 'domain': '.agentrouter.org', 'path': '/', 'value': 'evidence-cookie'},
+    ]))
+    page.context = context
+    browser = SimpleNamespace(new_context=AsyncMock(return_value=context), close=AsyncMock())
+    monkeypatch.setattr(login, 'launch_async', AsyncMock(return_value=browser))
+    verify = AsyncMock(side_effect=AssertionError('已取得登录响应后不应再轮询账号接口'))
+    monkeypatch.setattr(login, 'verify_target_profile', verify)
+    flow = login.LoginFlow(db)
+    path = provider.domain + '/api/oauth/linuxdo?code=abc&state=xyz&mode=login'
+
+    async def open_oauth(context_, page_, session_, provider_):
+        # 模拟站点自身完成授权并返回登录成功响应
+        context_.listeners['response'][0](FakeResponse(
+            path, FakeRequest(path, page_, frame_url=path),
+            body={'success': True, 'data': {'id': 7, 'username': 'linuxdo-user',
+                                            'quota': 45000000, 'used_quota': 5000000}},
+            set_cookie=['session=evidence-cookie; Path=/; HttpOnly']))
+        await settle()
+        return True
+    monkeypatch.setattr(flow, '_open_oauth', open_oauth)
+
+    session = login.LoginSession('agentrouter', 'linuxdo', '证据窗口')
+    await asyncio.wait_for(flow._run(session), 5)
+
+    assert session.status == 'success'
+    assert session.stage == 'identity_confirmed'
+    verify.assert_not_called()
+    account = db.account(session.account)
+    assert db.credentials(account) == {'session': 'evidence-cookie', 'api_user': '7'}
+    assert account['name'] == '证据窗口'
+    assert account['login_via'] == 'linuxdo'
+    assert account['balance'] == 90
+    assert account['used_quota'] == 10
+    assert account['total_quota'] == 100
+    assert account['has_snapshot'] == 1
+    browser.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_checkin_reauthentication_uses_observed_response_for_identity(db, monkeypatch):
+    """签到重登必须用本次窗口的登录证据确认身份，且不回写账号。"""
+    from unittest.mock import AsyncMock, Mock
+    import backend.login_flow as login
+
+    account_id = db.add_account(account(provider='agentrouter', auth_mode='session', email=None,
+                                       password=None, session='old', api_user='7', login_via='github'))
+    row = db.account(account_id)
+    before = dict(row)
+    provider = login.PROVIDERS['agentrouter']
+    page = SimpleNamespace(url=provider.domain + '/console', goto=AsyncMock(), evaluate=AsyncMock())
+    context = FakeContext([page], cookies=AsyncMock(return_value=[
+        {'name': 'session', 'domain': '.agentrouter.org', 'path': '/', 'value': 'fresh-login-cookie'},
+    ]))
+    page.context = context
+    browser = SimpleNamespace(new_context=AsyncMock(return_value=context), close=AsyncMock())
+    monkeypatch.setattr(login, 'launch_async', AsyncMock(return_value=browser))
+    flow = login.LoginFlow(db)
+    path = provider.domain + '/api/oauth/github?code=abc&state=xyz&mode=login'
+
+    async def open_oauth(context_, page_, session_, provider_):
+        context_.listeners['response'][0](FakeResponse(
+            path, FakeRequest(path, page_, frame_url=path),
+            body={'success': True, 'data': {'id': 7, 'quota': 57500000, 'used_quota': 5000000}},
+            set_cookie=['session=fresh-login-cookie; Path=/']))
+        await settle()
+        return True
+    monkeypatch.setattr(flow, '_open_oauth', open_oauth)
+    persist = AsyncMock(side_effect=AssertionError('签到重登不得写库'))
+    monkeypatch.setattr(flow, '_persist', persist)
+    read_credentials = Mock(side_effect=AssertionError('重登窗口不得读取旧凭据'))
+    monkeypatch.setattr(db, 'credentials', read_credentials)
+
+    result = await flow.authenticate_for_checkin(row, '7')
+
+    assert result == ({'profile': {'id': 7, 'quota': 57500000, 'used_quota': 5000000},
+                       'session': 'fresh-login-cookie'})
+    persist.assert_not_awaited()
+    read_credentials.assert_not_called()
+    assert dict(db.account(account_id)) == before
+
+
+@pytest.mark.asyncio
+async def test_agentrouter_self_success_without_profile_does_not_count_as_checkin(db, monkeypatch):
+    """HTTP 成功但没有用户资料时不能误报签到状态已同步。"""
+    import backend.engine as adapter
+
+    account_id = db.add_account(account(provider='agentrouter', auth_mode='session',
+                                       email=None, password=None, session='never-valid', api_user='1'))
+    row = db.account(account_id)
+    before = dict(row)
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def request(self, path, user, method='GET', payload=None):
+            assert path == '/api/user/self'
+            assert user == '1'
+            return {'status': 200, 'body': {'success': True, 'message': ''}}
+
+    monkeypatch.setattr(adapter, 'BrowserSession', lambda *args: FakeSession())
+
+    result = await adapter.CheckinEngine().run(row, db.credentials(row), True)
+
+    assert result['status'] == 'failed'
+    assert '账号信息验证未通过' in result['message']
+    assert result.get('reward') is None
+    assert '_session_update' not in result
+    assert dict(db.account(account_id)) == before

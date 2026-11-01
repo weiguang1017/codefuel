@@ -3,17 +3,20 @@ import asyncio
 import re
 import secrets
 import time
-from urllib.parse import urljoin, urlparse
+from playwright.async_api import Error as PlaywrightError
+from urllib.parse import urljoin, urlparse, parse_qs
+from http.cookies import SimpleCookie
 
 from cloakbrowser import launch_async
 
 from .providers import PROVIDERS, BROWSER_METHODS, supports
 from .upstream_imports import prepare_browser_page, wait_for_waf_ready
 
-WINDOW_TIMEOUT = 300
+WINDOW_TIMEOUT = 900
 OAUTH_LABELS = {'github': 'GitHub', 'linuxdo': 'LinuxDO'}
 OAUTH_BUTTONS = {
-    method: re.compile(r'^\s*(?:(?:使用|通过)\s*)?(?:(?:continue|sign\s*in|log\s*in|login)\s+with\s+)?'
+    method: re.compile(r'^\s*(?:' + (r'github(?:[_\s-]*logo)?' if method == 'github' else r'linux\s*do(?:[_\s-]*logo)?')
+                       + r'\s+)?(?:(?:使用|通过)\s*)?(?:(?:continue|sign\s*in|log\s*in|login)\s+with\s+)?'
                        + label + r'\s*(?:(?:继续|登录|授权|登入))?\s*$', re.IGNORECASE)
     for method, label in (('github', r'git\s*hub'), ('linuxdo', r'linux\s*do'))
 }
@@ -22,6 +25,11 @@ ACTIVE_STATUSES = ('starting', 'waiting', 'verifying')
 
 
 class LoginConflict(RuntimeError):
+    pass
+
+
+class ProfileVerificationBlocked(RuntimeError):
+    """A non-JSON or denied identity response needs user attention, not polling."""
     pass
 
 
@@ -35,13 +43,13 @@ async def verify_target_profile(page, provider):
     if _origin(page.url) != _origin(provider.domain):
         return None
     target = provider.domain + provider.user_info_path
-    result = await page.evaluate('''async (o) => {
+    result = await page.evaluate(r'''async (o) => {
       const target = new URL(o.url);
       if (location.origin !== target.origin) return null;
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 15000);
       try {
-        const headers = {'X-Requested-With': 'XMLHttpRequest'};
+        const headers = {'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json'};
         let hint = null;
         try { hint = JSON.parse(localStorage.getItem('user')); } catch (e) {}
         if (hint && hint.id != null) headers[o.userHeader] = String(hint.id);
@@ -50,15 +58,23 @@ async def verify_target_profile(page, provider):
           credentials: 'same-origin', cache: 'no-store', redirect: 'error',
           headers, signal: controller.signal
         });
+        const contentType = response.headers.get('content-type') || '';
+        if (!/application\/(?:[\w.-]+\+)?json\b/i.test(contentType)) {
+          return {url: response.url, status: response.status, nonJson: true};
+        }
         return {url: response.url, status: response.status, body: await response.json()};
       } catch (e) { return null; }
       finally { clearTimeout(timer); }
     }''', {'url': target, 'userHeader': provider.api_user_key, 'nonce': secrets.token_urlsafe(12)})
-    if not isinstance(result, dict) or result.get('status') != 200:
+    if not isinstance(result, dict):
         return None
     response_url = result.get('url', '')
     if (_origin(page.url) != _origin(provider.domain) or _origin(response_url) != _origin(target)
             or urlparse(response_url).path != urlparse(target).path):
+        return None
+    if result.get('nonJson') or result.get('status') in (403, 429):
+        raise ProfileVerificationBlocked('账号校验接口返回非 JSON 或拒绝访问，已暂停自动校验。')
+    if result.get('status') != 200:
         return None
     body = result.get('body')
     if not isinstance(body, dict) or body.get('success') is not True:
@@ -69,6 +85,110 @@ async def verify_target_profile(page, provider):
     if not str(profile.get('id', '')).isdigit() or int(profile['id']) <= 0:
         return None
     return profile
+
+
+class LoginEvidence:
+    """Observe normal site responses inside this one authorization context.
+
+    Never replay OAuth codes, inspect API-token endpoints, or trust DOM/storage as
+    identity. Evidence is short-lived and tied to the exact site session cookie.
+    """
+    def __init__(self, context, provider, method, read_cookie):
+        self.context, self.provider, self.method = context, provider, method
+        self.read_cookie = read_cookie
+        self.changed = asyncio.Event()
+        self.tasks = set()
+        self.latest = None
+        self.sequence = 0
+
+    def start(self):
+        self.context.on('response', self._on_response)
+
+    def _on_response(self, response):
+        path = urlparse(response.url).path
+        if _origin(response.url) != _origin(self.provider.domain):
+            return
+        login_paths = {'/api/user/login'}
+        if self.method in OAUTH_LABELS:
+            login_paths.add(f'/api/oauth/{self.method}')
+        elif self.method == 'manual':
+            login_paths.update(f'/api/oauth/{method}' for method in OAUTH_LABELS)
+        if path not in login_paths | {self.provider.user_info_path}:
+            return
+        if path in login_paths:
+            self.sequence += 1
+            self.latest = None
+        sequence = self.sequence
+        task = asyncio.create_task(self._capture(response, sequence, path in login_paths))
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+
+    async def _capture(self, response, sequence, is_login):
+        try:
+            request = response.request
+            page = request.frame.page
+            if (page.context is not self.context
+                    or _origin(request.url) != _origin(self.provider.domain)
+                    or _origin(request.frame.url) != _origin(self.provider.domain)
+                    or response.status != 200 or response.from_service_worker):
+                return
+            if '/api/oauth/' in urlparse(request.url).path:
+                query = parse_qs(urlparse(request.url).query)
+                if not query.get('code') or not query.get('state') or query.get('mode', ['login']) != ['login']:
+                    return
+            headers = await response.all_headers()
+            if not re.search(r'application/(?:[\w.-]+\+)?json\b', headers.get('content-type', ''), re.I):
+                return
+            if await response.finished() is not None:
+                return
+            body = await response.json()
+            if not isinstance(body, dict) or body.get('success') is not True or body.get('message') == 'bind':
+                return
+            data = body.get('data')
+            if (not isinstance(data, dict) or isinstance(data.get('id'), bool)
+                    or not str(data.get('id', '')).isdigit() or int(data['id']) <= 0):
+                return
+            cookie = await self.read_cookie(self.context, self.provider)
+            if not cookie:
+                return
+            # A login response must itself issue the matching target-site session.
+            values = await response.header_values('set-cookie') if is_login else []
+            if not is_login:
+                values = [(await request.all_headers()).get('cookie', '')]
+            matches = False
+            for value in values:
+                parsed = SimpleCookie()
+                parsed.load(value)
+                if 'session' in parsed and parsed['session'].value == cookie:
+                    matches = True
+            if not matches or sequence != self.sequence:
+                return
+            profile = {key: data[key] for key in ('id', 'username', 'quota', 'used_quota', 'checked_in') if key in data}
+            self.latest = (profile, cookie, time.monotonic(), page)
+            self.changed.set()
+        except Exception:
+            # Only allowlisted structured fields are retained; never log raw auth responses.
+            return
+
+    async def get(self):
+        evidence = self.latest
+        if not evidence:
+            return None
+        profile, cookie, received, page = evidence
+        if (time.monotonic() - received > 120 or page not in self.context.pages
+                or _origin(page.url) != _origin(self.provider.domain)
+                or cookie != await self.read_cookie(self.context, self.provider)):
+            return None
+        return profile, cookie
+
+    async def close(self):
+        self.context.remove_listener('response', self._on_response)
+        tasks = list(self.tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.latest = None
 
 
 class LoginSession:
@@ -85,6 +205,9 @@ class LoginSession:
         self.account = account_id
         self.cancelled = False
         self.task = None
+        self.stage = 'opening'
+        self.verification_paused = False
+        self.resume_event = asyncio.Event()
 
 
 class LoginFlow:
@@ -136,7 +259,16 @@ class LoginFlow:
             return None
         return {'id': session.id, 'provider': session.provider, 'method': session.method,
                 'status': session.status, 'message': session.message,
-                'account_id': session.account, 'elapsed': int(time.time() - session.created)}
+                'account_id': session.account, 'elapsed': int(time.time() - session.created),
+                'stage': session.stage, 'verification_paused': session.verification_paused}
+
+    def resume_verification(self, session_id):
+        session = self.sessions.get(session_id)
+        if not session or session.status not in ACTIVE_STATUSES or not session.verification_paused:
+            return False
+        session.verification_paused = False
+        session.resume_event.set()
+        return True
 
     def cancel(self, session_id):
         with self.store.lock:
@@ -164,6 +296,31 @@ class LoginFlow:
         pending = [s for s in self.sessions.values() if s.task and not s.task.done()]
         self.sessions = {s.id: s for s in keep + pending}
 
+    async def authenticate_for_checkin(self, row, api_user):
+        """Fresh, interactive site login; never import the old site session."""
+        session = LoginSession(row['provider'], row['login_via'] or 'manual', row['name'], row['id'])
+        if session.method not in BROWSER_METHODS:
+            session.method = 'manual'
+        session.checkin_identity = str(api_user)
+        # 签到语义：先退出旧会话，再由用户重新登录。
+        session.checkin_logout = bool(PROVIDERS[row['provider']].logout_path)
+        session.checkin_result = None
+        self.sessions[session.id] = session
+        session.task = asyncio.current_task()
+        try:
+            async with self.window_lock:
+                self.active_id = session.id
+                session.created = time.time()
+                await self._run_window(session)
+            return session.checkin_result
+        except asyncio.CancelledError:
+            if session.cancelled:
+                return None
+            raise
+        finally:
+            session.checkin_result = None
+            self.sessions.pop(session.id, None)
+
     async def _run(self, session):
         async with self.window_lock:
             await self._run_window(session)
@@ -171,17 +328,33 @@ class LoginFlow:
     async def _run_window(self, session):
         provider = PROVIDERS[session.provider]
         browser = None
+        evidence = None
         try:
             if session.cancelled or session.status not in ACTIVE_STATUSES:
                 return
             browser = await asyncio.wait_for(launch_async(headless=False), timeout=90)
             context = await browser.new_context(viewport=None)
+            evidence = LoginEvidence(context, provider, session.method, self._session_cookie)
+            evidence.start()
             page = await context.new_page()
-            await prepare_browser_page(page)
+            # Interactive authorization must not auto-dismiss consent/verification dialogs.
             await page.goto(provider.domain + provider.login_path, wait_until='domcontentloaded', timeout=60000)
-            await wait_for_waf_ready(page)
             if session.cancelled:
                 return
+            if getattr(session, 'checkin_logout', False) and provider.logout_path:
+                # 签到语义要求先退出旧会话；这一步也必须在真人窗口内完成，
+                # 避免无头会话的连续接口请求触发站点滑动验证。
+                await self._logout_in_window(page, session, provider)
+                if session.cancelled:
+                    return
+                # 退出后当前页面可能仍是控制台（站点不做前端跳转），而登录入口只渲染在
+                # 登录页；不重新打开登录页就会误判为「未提供授权入口」。
+                if urlparse(page.url).path.rstrip('/') != provider.login_path.rstrip('/'):
+                    try:
+                        await page.goto(provider.domain + provider.login_path,
+                                        wait_until='domcontentloaded', timeout=60000)
+                    except PlaywrightError:
+                        pass
             session.status = 'waiting'
             if session.method in OAUTH_LABELS:
                 label = OAUTH_LABELS[session.method]
@@ -204,21 +377,76 @@ class LoginFlow:
             while time.monotonic() < deadline:
                 if session.cancelled or session.status not in ACTIVE_STATUSES:
                     return
+                if not context.pages:
+                    session.status, session.message = 'cancelled', '登录窗口已关闭，未保存账号。'
+                    return
+                captured = await evidence.get()
+                if captured:
+                    profile, cookie = captured
+                    await self._complete_login(session, profile, cookie)
+                    return
                 cookie = await self._session_cookie(context, provider)
                 target_pages = [p for p in context.pages if _origin(p.url) == _origin(provider.domain)]
                 if cookie and target_pages:
                     session.status = 'verifying'
-                    session.message = '已检测到登录状态，正在校验账号…'
-                    profile = await verify_target_profile(target_pages[-1], provider)
+                    session.stage = 'verifying_target'
+                    session.message = '已返回目标平台并检测到会话，正在通过本站接口确认身份…'
+                    profile = None
+                    for target_page in reversed(target_pages):
+                        try:
+                            profile = await verify_target_profile(target_page, provider)
+                        except ProfileVerificationBlocked:
+                            session.status = 'waiting'
+                            session.stage = 'verification_blocked'
+                            session.verification_paused = True
+                            session.resume_event.clear()
+                            session.message = ('目标平台账号接口返回防护页面或拒绝访问，尚未确认账号身份；已暂停自动请求。'
+                                               '请在当前窗口手动处理网站验证，再点击「我已处理，重新校验」。'
+                                               '仅登录 LinuxDO/GitHub 不代表已完成目标平台授权。')
+                            while True:
+                                resume = asyncio.create_task(session.resume_event.wait())
+                                observed = asyncio.create_task(evidence.changed.wait())
+                                try:
+                                    done, _ = await asyncio.wait({resume, observed},
+                                        timeout=max(0.1, deadline - time.monotonic()),
+                                        return_when=asyncio.FIRST_COMPLETED)
+                                    if not done:
+                                        session.status, session.message = 'expired', '等待人工处理已超时；未取得目标平台有效授权响应，未保存账号。'
+                                        return
+                                    evidence.changed.clear()
+                                    captured = await evidence.get()
+                                    if captured:
+                                        await self._complete_login(session, *captured)
+                                        return
+                                    if resume in done:
+                                        break
+                                finally:
+                                    for waiter in (resume, observed):
+                                        if not waiter.done():
+                                            waiter.cancel()
+                                    await asyncio.gather(resume, observed, return_exceptions=True)
+                            break
+                        except PlaywrightError as exc:
+                            if 'Execution context was destroyed' not in str(exc):
+                                raise
+                            session.stage = 'returning_to_target'
+                            session.message = '目标平台仍在跳转，等待页面稳定后再校验。'
+                            continue
+                        if profile:
+                            break
                     if profile and cookie == await self._session_cookie(context, provider):
-                        await self._persist(session, profile, cookie)
+                        await self._complete_login(session, profile, cookie)
                         return
                     if session.cancelled or session.status not in ACTIVE_STATUSES:
                         return
                     session.status = 'waiting'
-                    session.message = '检测到站点 Cookie，但尚未确认登录成功；请完成登录及授权，返回目标平台控制台后稍候。'
+                    session.message = '检测到站点会话，但账号接口尚未确认身份；请完成目标平台授权后稍候。'
+                else:
+                    session.stage = 'waiting_target_session' if target_pages else 'waiting_upstream'
+                    session.message = ('尚未取得目标平台有效会话；请完成登录并返回目标平台控制台。'
+                                       if target_pages else '仍在身份提供方登录或验证页面；请手动完成并确认授权，返回目标平台。')
                 await asyncio.sleep(1.5)
-            session.status, session.message = 'expired', '等待超时，请重新发起授权。'
+            session.status, session.message = 'expired', f'等待授权超时（阶段：{session.stage}）；未确认目标平台身份，未保存账号。'
         except asyncio.CancelledError:
             if session.status in ACTIVE_STATUSES:
                 session.status, session.message = 'cancelled', '已取消授权。'
@@ -228,17 +456,74 @@ class LoginFlow:
                 session.status = 'failed'
                 session.message = '登录窗口未能完成，请重试，或改用账号密码 / Session 方式。'
         finally:
+            if evidence:
+                await evidence.close()
             if browser:
                 try:
                     await browser.close()
                 except Exception:
                     pass
 
+    async def _logout_in_window(self, page, session, provider):
+        """在真人窗口内退出旧会话；失败不阻断后续登录，只记录提示。"""
+        session.stage = 'logging_out'
+        session.message = '正在退出该平台旧会话，随后请重新登录以完成签到…'
+        try:
+            result = await page.evaluate(r'''async (o) => {
+              const response = await fetch(o.url, {
+                credentials: 'include', cache: 'no-store',
+                headers: {'X-Requested-With': 'XMLHttpRequest'}
+              });
+              const text = await response.text();
+              let body = null;
+              try { body = JSON.parse(text); } catch (e) {}
+              return {status: response.status, body,
+                      guarded: /text\/html/i.test(response.headers.get('content-type') || '')};
+            }''', {'url': provider.domain + provider.logout_path})
+        except PlaywrightError:
+            return
+        if not isinstance(result, dict) or result.get('guarded'):
+            return
+        body = result.get('body')
+        # 站点在未登录时也返回 success，因此这里只用于触发退出动作，不做断言。
+        if result.get('status') == 200 and isinstance(body, dict) and body.get('success') is True:
+            session.stage = 'logged_out'
+        # 给站点风控窗口留出间隔，避免紧接着的登录请求被判为自动化流量。
+        await asyncio.sleep(1.2)
+
+    async def _complete_login(self, session, profile, cookie):
+        if session.cancelled or session.status not in ACTIVE_STATUSES:
+            return
+        session.verification_paused = False
+        session.stage = 'identity_confirmed'
+        if hasattr(session, 'checkin_identity'):
+            if str(profile['id']) != session.checkin_identity:
+                session.status, session.message = 'failed', '本次登录身份与原账号不同，未更新账号。'
+                return
+            session.checkin_result = {'profile': profile, 'session': cookie}
+            session.status = 'success'
+        else:
+            await self._persist(session, profile, cookie)
+
     async def _open_oauth(self, context, page, session, provider):
         if await self._click_oauth(context, page, session.method, provider):
             return True
         if session.cancelled:
             return False
+        if urlparse(page.url).path.rstrip('/') != provider.login_path.rstrip('/'):
+            # 页面上此刻没有授权入口：先回到站点的登录页再找一次。
+            # 只做同源导航，不填表、不提交注册、不构造授权 URL。
+            try:
+                await page.goto(provider.domain + provider.login_path,
+                                wait_until='domcontentloaded', timeout=60000)
+            except PlaywrightError:
+                return False
+            if session.cancelled or _origin(page.url) != _origin(provider.domain):
+                return False
+            if await self._click_oauth(context, page, session.method, provider):
+                return True
+            if session.cancelled:
+                return False
         paths = provider.oauth_navigation_paths
         if not paths or urlparse(page.url).path.rstrip('/') != provider.login_path.rstrip('/'):
             return False
@@ -352,8 +637,8 @@ class LoginFlow:
                 session.status, session.message = 'error', '未能读取登录凭据，请重新发起授权。'
                 return
             name = session.name or str(profile.get('username') or OAUTH_LABELS.get(session.method, '账号'))
-            quota = round((profile.get('quota') or 0) / 500000, 2)
-            used = round((profile.get('used_quota') or 0) / 500000, 2)
+            quota = round(profile['quota'] / 500000, 2) if isinstance(profile.get('quota'), (int, float)) else None
+            used = round(profile['used_quota'] / 500000, 2) if isinstance(profile.get('used_quota'), (int, float)) else None
             login_via = session.method if session.method in OAUTH_LABELS else 'manual'
             if session.account_id is not None:
                 try:
@@ -374,6 +659,8 @@ class LoginFlow:
                     'interval_hours': session.interval_hours, 'enabled': True,
                     'session': session_cookie, 'api_user': str(profile['id']), 'login_via': login_via,
                 })
-                self.store.patch(session.account, balance=quota, used_quota=used, has_snapshot=1,
-                                 total_quota=round(quota + used, 2), last_message='已通过浏览器授权关联账号')
+                known_balance = quota is not None and used is not None
+                self.store.patch(session.account, balance=quota, used_quota=used, has_snapshot=int(known_balance),
+                                 total_quota=round(quota + used, 2) if known_balance else None,
+                                 last_message='已通过浏览器授权关联账号')
             session.status, session.message = 'success', f'已保存「{name}」的登录状态。'

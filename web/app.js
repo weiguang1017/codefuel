@@ -175,12 +175,12 @@ function launchLogin(options,selected=[options.provider]){
 function renderLoginQueue(queue){
   if(state.loginQueue!==queue||queue.stopped)return;
   const item=queue.items[queue.index];
-  const statuses={pending:'等待',starting:'正在发起',waiting:'等待授权',success:'已保存',error:'未完成',network:'连接中断',unknown:'结果待确认',skipped:'已跳过'};
+  const statuses={pending:'等待',starting:'正在发起',waiting:'等待授权',blocked:'等待人工处理',success:'已保存',error:'未完成',network:'连接中断',unknown:'结果待确认',skipped:'已跳过'};
   const finished=queue.items.filter(i=>i.status==='success').length;
   modal(`<div class="modal-head"><div><h2>${queue.done?'授权结果':`${methodName(queue.options.method)} · 逐平台授权`}</h2><p>${queue.done?`${finished} / ${queue.items.length} 个平台已独立保存`:`当前 ${queue.index+1} / ${queue.items.length} · ${providerName(item.provider)}`}；已完成的账号会保留。</p></div><button class="icon-button" data-action="close" aria-label="关闭">${icon('x')}</button></div>
     <ol class="platform-progress" aria-live="polite">${queue.items.map((entry,index)=>`<li class="${esc(entry.status)} ${index===queue.index&&!queue.done?'current':''}"><div><b>${providerName(entry.provider)}</b><span>${statuses[entry.status]||esc(entry.status)}</span></div><p>${esc(entry.message)}</p></li>`).join('')}</ol>
     ${!queue.done?`<div class="notice">${icon('info')}每个平台分别在浏览器中授权。入口不可用时可跳过；取消或关闭会停止整个队列，不撤销已保存账号。</div>`:''}
-    <div class="modal-actions">${queue.done?'<button class="button primary" data-action="close">完成</button>':`<button class="button secondary" data-action="cancel-login">取消全部</button>${item.status==='error'?'<button class="button secondary" data-action="skip-login">跳过此平台</button><button class="button primary" data-action="retry-login">重试此平台</button>':''}${item.status==='network'?'<button class="button primary" data-action="retry-poll">重试查询当前授权</button>':''}${item.status==='unknown'?'<span class="field-help">为避免重复账号，不自动重新发起授权。</span>':''}`}</div>`);
+    <div class="modal-actions">${queue.done?'<button class="button primary" data-action="close">完成</button>':`<button class="button secondary" data-action="cancel-login">取消全部</button>${item.status==='error'?'<button class="button secondary" data-action="skip-login">跳过此平台</button><button class="button primary" data-action="retry-login">重试此平台</button>':''}${item.status==='blocked'?'<button class="button primary" data-action="resume-login">我已处理，重新校验</button>':''}${item.status==='network'?'<button class="button primary" data-action="retry-poll">重试查询当前授权</button>':''}${item.status==='unknown'?'<span class="field-help">为避免重复账号，不自动重新发起授权。</span>':''}`}</div>`);
 }
 async function startQueueItem(queue){
   if(!queueActive(queue)||queue.starting)return;
@@ -224,7 +224,7 @@ async function pollLogin(queue){
       if(result.status==='unavailable')item.message=result.message||`平台不支持或未提供 ${methodName(queue.options.method)} 入口。`;
       renderLoginQueue(queue);return;
     }
-    item.status='waiting';renderLoginQueue(queue);
+    item.status=result.verification_paused?'blocked':'waiting';renderLoginQueue(queue);
     loginPoll=setTimeout(()=>pollLogin(queue),1000);
   }catch(error){
     if(!queueActive(queue))return;
@@ -260,6 +260,7 @@ document.addEventListener('click',async e=>{const btn=e.target.closest('button')
  else if(btn.dataset.action==='cancel-login')closeModal();
  else if(btn.dataset.action==='retry-login'){const q=state.loginQueue;if(queueActive(q)&&q.items[q.index].status==='error')void startQueueItem(q);}
  else if(btn.dataset.action==='skip-login'){const q=state.loginQueue;if(queueActive(q)&&q.items[q.index].status==='error'){q.items[q.index].status='skipped';advanceQueue(q);}}
+ else if(btn.dataset.action==='resume-login'){const q=state.loginQueue;if(queueActive(q)&&q.session){await api(`/api/login/${encodeURIComponent(q.session)}/resume`,{method:'POST',body:{}});q.items[q.index].status='waiting';q.items[q.index].message='正在重新校验目标平台身份…';renderLoginQueue(q);}}
  else if(btn.dataset.action==='retry-poll'){const q=state.loginQueue;if(queueActive(q)&&q.items[q.index].status==='network')void pollLogin(q);}
  else if(btn.dataset.action==='connect-platform'){const a=state.data.accounts.find(x=>x.id===Number(btn.dataset.id));if(a&&isOAuth(a.login_via))accountModal(null,a);}
  else if(btn.dataset.action==='relogin'){const a=state.data.accounts.find(x=>x.id===Number(btn.dataset.id));if(!a)return;const method=isBrowser(a.login_via)?a.login_via:'manual';launchLogin({provider:a.provider,method,interval_hours:a.interval_hours,name:a.name,account_id:a.id});}

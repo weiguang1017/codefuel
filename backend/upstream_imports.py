@@ -19,3 +19,4 @@ from utils.browser import (  # noqa: E402,F401
     wait_for_waf_ready,
 )
 from utils.config import ProviderConfig  # noqa: E402,F401
+from utils.proxy import get_playwright_proxy  # noqa: E402,F401

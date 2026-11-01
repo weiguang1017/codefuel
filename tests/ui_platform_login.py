@@ -43,6 +43,7 @@ class API:
         self.accounts = copy.deepcopy(accounts or [])
         self.plans = list(plans or [])
         self.starts, self.cancels, self.updates, self.creates = [], [], [], []
+        self.resumes, self.polled_sessions = [], []
         self.sessions = {}
         self.polls = 0
         self.inflight = 0
@@ -95,7 +96,8 @@ class API:
             if plan.get('http_error'):
                 return await route.fulfill(status=plan['http_error'], json={'detail': plan.get('message', '模拟服务暂不可用')})
             sid = str(len(self.starts))
-            self.sessions[sid] = {'payload': payload, 'plan': plan, 'poll': 0, 'cancelled': False}
+            self.sessions[sid] = {'payload': payload, 'plan': plan, 'poll': 0, 'cancelled': False,
+                                  'verification_paused': plan.get('verification_paused', False)}
             if plan.get('start_entered'):
                 plan['start_entered'].set()
             if plan.get('hold_start'):
@@ -112,7 +114,14 @@ class API:
                     self.save(session)
                     return await route.fulfill(json={'id': sid, 'status': 'success'})
                 return await route.fulfill(json={'id': sid, 'status': 'cancelled'})
+            if path.endswith('/resume'):
+                assert request.method == 'POST'
+                assert session['verification_paused'] and not session['cancelled']
+                self.resumes.append(sid)
+                session['verification_paused'] = False
+                return await route.fulfill(json={'id': sid, 'status': 'waiting', 'verification_paused': False})
             self.polls += 1
+            self.polled_sessions.append(sid)
             self.inflight += 1
             self.max_inflight = max(self.max_inflight, self.inflight)
             try:
@@ -120,6 +129,9 @@ class API:
                     plan['poll_entered'].set()
                 if plan.get('hold_poll'):
                     await plan['hold_poll'].wait()
+                if session['verification_paused']:
+                    return await route.fulfill(json={'id': sid, 'status': 'waiting', 'verification_paused': True,
+                                                     'message': '请在当前登录窗口完成人工处理，然后重新校验。'})
                 index = session['poll']
                 session['poll'] += 1
                 statuses = plan.get('statuses', ['waiting'])
@@ -296,6 +308,51 @@ async def cases(browser, base):
     assert api.accounts[0]['provider'] == 'agentrouter'
     await api.close()
     results.append('失败原因、当前平台重试、部分成功与跳过继续')
+
+    # 人工处理期间只查询原会话，显式恢复后保存；暂停时仍可取消整个队列。
+    for action in ['resume', 'cancel']:
+        api = API(plans=[{'verification_paused': True, 'statuses': ['success']}])
+        page = await api.attach(browser, base)
+        await add(page, multiple=action == 'cancel')
+        await page.locator('#account-submit').click()
+        blocked = page.locator('.platform-progress .blocked')
+        resume = page.locator('[data-action="resume-login"]')
+        cancel = page.locator('[data-action="cancel-login"]')
+        await expect(blocked).to_contain_text('等待人工处理')
+        await expect(blocked).to_contain_text('请在当前登录窗口完成人工处理')
+        await expect(resume).to_have_text('我已处理，重新校验')
+        await expect(resume).to_be_enabled()
+        await expect(cancel).to_be_enabled()
+        await wait_count(api.polled_sessions, 3)
+        await expect(blocked).to_be_visible()
+        await expect(resume).to_be_visible()
+        assert len(api.starts) == 1 and list(api.sessions) == ['1']
+        assert set(api.polled_sessions) == {'1'}
+        assert not api.accounts and not api.resumes and not api.cancels
+        assert await page.locator('[data-action="retry-login"]').count() == 0
+        if action == 'resume':
+            await resume.click()
+            await expect(page.locator('#modal h2')).to_have_text('授权结果')
+            await expect(page.locator('.platform-progress .success')).to_have_count(1)
+            await expect(page.locator('#nav-count')).to_have_text('1')
+            await expect(resume).to_have_count(0)
+            assert api.resumes == ['1'] and not api.cancels
+            assert not api.sessions['1']['verification_paused']
+            assert api.sessions['1']['saved'] and len(api.accounts) == 1
+            assert api.accounts[0]['provider'] == 'anyrouter'
+            assert api.accounts[0]['login_via'] == 'github'
+        else:
+            await expect(page.locator('.platform-progress .pending')).to_have_count(1)
+            await cancel.click()
+            await expect(page.locator('#modal')).not_to_be_visible()
+            await wait_count(api.cancels, 1)
+            await expect(page.locator('#nav-count')).to_have_text('0')
+            assert api.cancels == ['1'] and api.sessions['1']['cancelled']
+            assert not api.resumes and not api.accounts
+        assert len(api.starts) == 1 and list(api.sessions) == ['1']
+        assert set(api.polled_sessions) == {'1'} and not api.creates
+        await api.close()
+    results.append('人工处理暂停提示、原会话轮询与显式恢复保存、暂停时取消')
 
     # 请求未返回就关闭/ESC/取消；回包后取消旧会话，不触发下一平台。
     for action in ['close', 'escape', 'cancel']:

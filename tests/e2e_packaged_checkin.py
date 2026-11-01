@@ -14,7 +14,9 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-APP = ROOT / 'dist-new' / 'CodeFuel.app' / 'Contents' / 'MacOS' / 'CodeFuel'
+DEFAULT_APP = ROOT / 'dist' / 'CodeFuel.app' / 'Contents' / 'MacOS' / 'CodeFuel'
+# 可用 CODEFUEL_APP 指向任意打包产物，避免把临时构建目录写死在脚本里。
+APP = Path(os.environ.get('CODEFUEL_APP') or DEFAULT_APP)
 PORT = 18896
 BASE = f'http://127.0.0.1:{PORT}'
 
@@ -92,7 +94,14 @@ def main():
             print(f'{"":12s} message={run.get("message")}')
             print(f'{"":12s} before={run.get("before_balance")} after={run.get("after_balance")} '
                   f'reward={run.get("reward")}')
-        return 0
+        # 占位会话无效；AgentRouter 应通过后台 API 明确失败，不得弹出交互登录窗口。
+        agent = rows[ids[1]]
+        message = agent.get('last_message') or ''
+        interactive = '授权窗口' in message or '正在重新登录' in message
+        print(f'\nAgentRouter 后台签到：{"触发了交互授权" if interactive else agent["status"]}')
+        ok = agent['status'] in ('manual_required', 'failed') and not interactive
+        print('\n[通过] 无效会话在后台明确失败' if ok else '\n[未通过] AgentRouter 未按预期处理无效会话')
+        return 0 if ok else 1
     finally:
         process.terminate()
         try:
