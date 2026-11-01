@@ -13,10 +13,10 @@ data/
 # 构建产物与临时物
 dist/
 dist-new/
-build/pyinstaller-agentrouter-login/
+# PyInstaller 的全部中间工作目录（含构建取证快照），可随时重新生成
+build/pyinstaller-*/
 build/pyinstaller/
 build/.pyinstaller/
-build/pyinstaller-codefuel/
 build/icon.iconset/
 build/*-selftest/
 build/test-*/
