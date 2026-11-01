@@ -6,7 +6,7 @@ from pathlib import Path
 
 APP_NAME = '码粮 CodeFuel'
 APP_SLUG = 'CodeFuel'
-APP_VERSION = '0.4.5'
+APP_VERSION = '1.0.0'
 APP_SLOGAN = '为代码添粮，让灵感续航。'
 # 当前数据命名空间。改名前的 DailyQuota 会在首次启动时自动迁移过来。
 DATA_NAMESPACE = 'CodeFuel'
