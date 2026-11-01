@@ -1,14 +1,23 @@
 """Check-in adapters derived from millylee/anyrouter-check-in (BSD-2-Clause).
 No browser profile is persisted: account secrets stay in the encrypted database.
 """
+import asyncio
 import os
 import sys
 import time
 from pathlib import Path
 import httpx
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from .providers import PROVIDERS
-from .upstream_imports import login_with_credentials, prepare_browser_page, wait_for_waf_ready
+from .upstream_imports import login_with_credentials, prepare_browser_page
+
+# The sites are SPAs whose own redirects continue after `goto` resolves. Any browser
+# call issued in that window dies with a destroyed execution context, so settle first.
+SETTLE_TIMEOUT = 10.0
+SETTLE_STABLE = 0.6
+CONTEXT_RETRIES = 3
 
 
 def _local_chrome():
@@ -63,12 +72,54 @@ class BrowserSession:
         self.browser = await launch_async(headless=True)
         context = await self.browser.new_context()
         host = urlparse(self.provider.domain).hostname
-        await context.add_cookies([{'name': name, 'value': value, 'domain': host, 'path': '/'} for name, value in self.cookies.items()])
         self.page = await context.new_page()
         await prepare_browser_page(self.page)
-        await self.page.goto(self.provider.domain + self.provider.login_path, wait_until='domcontentloaded')
-        await wait_for_waf_ready(self.page)
+        # Let the site issue its own WAF cookies before the account session is added.
+        await self._goto(self.provider.domain)
+        await context.add_cookies([
+            {'name': name, 'value': value, 'domain': host, 'path': '/'}
+            for name, value in self.cookies.items()
+        ])
+        await self._goto(self.provider.domain + self.provider.login_path)
         return self
+
+    async def _goto(self, url):
+        """Navigate without waiting on site UI.
+
+        The sites are SPAs that redirect on their own after load; waiting for a
+        rendered login shell here costs a full timeout and then aborts our next
+        navigation, so only the document itself is awaited. A run that loses the
+        race to the site's own redirect is fine as long as we stay on the site.
+        """
+        try:
+            await self.page.goto(url, wait_until='domcontentloaded', timeout=60_000)
+        except PlaywrightError as exc:
+            if 'ERR_ABORTED' not in str(exc) or not self.page.url.startswith(self.provider.domain):
+                raise
+        await self._settle()
+
+    async def _settle(self):
+        """Wait until the site stops redirecting, so evaluate() keeps a live context."""
+        deadline = time.monotonic() + SETTLE_TIMEOUT
+        previous = None
+        stable_since = None
+        while time.monotonic() < deadline:
+            try:
+                current = self.page.url
+            except PlaywrightError:
+                current = None
+            if current and current == previous:
+                stable_since = stable_since or time.monotonic()
+                if time.monotonic() - stable_since >= SETTLE_STABLE:
+                    break
+            else:
+                stable_since = None
+            previous = current
+            await asyncio.sleep(0.1)
+        try:
+            await self.page.wait_for_load_state('domcontentloaded', timeout=3_000)
+        except PlaywrightError:
+            pass
 
     async def request(self, path, api_user, method='GET', payload=None):
         script = '''async (o) => {
@@ -81,7 +132,15 @@ class BrowserSession:
           try { body = JSON.parse(text); } catch (e) {}
           return {status: response.status, body};
         }'''
-        return await self.page.evaluate(script, {'path': path, 'user': str(api_user), 'method': method, 'payload': payload})
+        args = {'path': path, 'user': str(api_user), 'method': method, 'payload': payload}
+        for attempt in range(CONTEXT_RETRIES):
+            try:
+                return await self.page.evaluate(script, args)
+            except PlaywrightError as exc:
+                # Only a navigation teardown is retried; a real API error must surface.
+                if attempt == CONTEXT_RETRIES - 1 or 'Execution context was destroyed' not in str(exc):
+                    raise
+                await self._settle()
 
     async def __aexit__(self, *args):
         if self.browser:
@@ -135,10 +194,13 @@ class CheckinEngine:
                 result['reward'] = round(after_total - before_total, 2) if provider.sign_in_path else (observed if observed is not None and observed > 0 else None)  # noqa: F821
                 if result['reward'] is not None and result['reward'] > 0 and provider.sign_in_path:
                     result['message'] += f' 本次额度增加 ${result["reward"]:.2f}。'
-        except (httpx.HTTPError, TimeoutError):
-            result.update(message='网络连接失败，请检查网络或代理设置后重试。')
-        except Exception:
-            result.update(status='manual_required', message='浏览器或站点验证未完成，请检查凭据与官网人机验证。')
+        except (httpx.HTTPError, TimeoutError, PlaywrightTimeoutError):
+            result.update(message='网络连接失败或站点页面加载超时，未确认签到结果；请检查网络或代理设置后重试。')
+        except Exception as exc:
+            result.update(status='failed', message=(
+                f'浏览器执行异常（{type(exc).__name__}），未确认签到结果；'
+                '请重试，若持续发生请导出日志反馈。'
+            ))
         finally:
             result['duration_ms'] = int((time.monotonic() - start) * 1000)
         return result

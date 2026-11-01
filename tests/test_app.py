@@ -173,6 +173,246 @@ async def test_agentrouter_observes_change_without_signin_request(db, monkeypatc
     assert '观察值' in result['message']
 
 
+@pytest.mark.asyncio
+async def test_browser_session_primes_site_before_account_session(monkeypatch):
+    import backend.engine as adapter
+    from backend.providers import PROVIDERS
+
+    events = []
+
+    class FakePage:
+        url = 'https://anyrouter.top'
+
+        async def goto(self, url, **kwargs):
+            events.append(('goto', url, kwargs.get('timeout')))
+
+        async def wait_for_load_state(self, *args, **kwargs):
+            return None
+
+    class FakeContext:
+        async def new_page(self):
+            events.append(('new_page',))
+            return FakePage()
+
+        async def add_cookies(self, cookies):
+            events.append(('cookies', [cookie['name'] for cookie in cookies]))
+
+    class FakeBrowser:
+        async def new_context(self):
+            events.append(('new_context',))
+            return FakeContext()
+
+        async def close(self):
+            events.append(('close',))
+
+    async def fake_launch(**kwargs):
+        events.append(('launch', kwargs))
+        return FakeBrowser()
+
+    async def fake_prepare(page):
+        events.append(('prepare',))
+
+    async def forbidden_waf(page):
+        raise AssertionError('签到流程不应等待站点 UI 渲染')
+
+    monkeypatch.setattr(adapter, 'launch_async', fake_launch)
+    monkeypatch.setattr(adapter, 'prepare_browser_page', fake_prepare)
+    monkeypatch.setattr(adapter, 'wait_for_waf_ready', forbidden_waf, raising=False)
+
+    async with adapter.BrowserSession(PROVIDERS['anyrouter'], {'session': 'account-session'}) as session:
+        assert session.page is not None
+
+    assert [event[0] for event in events] == [
+        'launch', 'new_context', 'new_page', 'prepare', 'goto', 'cookies', 'goto', 'close',
+    ]
+    assert events[4][1] == 'https://anyrouter.top'
+    assert events[4][2] == 60_000
+    assert events[5] == ('cookies', ['session'])
+    assert events[6][1] == 'https://anyrouter.top/login'
+    assert events[6][2] == 60_000
+
+
+@pytest.mark.asyncio
+async def test_spa_self_redirect_abort_is_not_a_checkin_failure(monkeypatch):
+    """AnyRouter 会在根页自行跳转；我们的下一次导航被它打断时不能算失败。"""
+    from playwright.async_api import Error as PlaywrightError
+    import backend.engine as adapter
+    from backend.providers import PROVIDERS
+
+    class FakePage:
+        def __init__(self):
+            self.url = 'https://anyrouter.top'
+            self.calls = 0
+
+        async def goto(self, url, **kwargs):
+            self.calls += 1
+            if self.calls == 2:
+                self.url = 'https://anyrouter.top/login'
+                raise PlaywrightError('Page.goto: net::ERR_ABORTED at ' + url)
+
+        async def wait_for_load_state(self, *args, **kwargs):
+            return None
+
+    class FakeContext:
+        async def new_page(self):
+            return FakePage()
+
+        async def add_cookies(self, cookies):
+            pass
+
+    class FakeBrowser:
+        async def new_context(self):
+            return FakeContext()
+
+        async def close(self):
+            pass
+
+    async def fake_launch(**kwargs):
+        return FakeBrowser()
+
+    async def fake_prepare(page):
+        pass
+
+    monkeypatch.setattr(adapter, 'launch_async', fake_launch)
+    monkeypatch.setattr(adapter, 'prepare_browser_page', fake_prepare)
+
+    session = adapter.BrowserSession(PROVIDERS['anyrouter'], {'session': 'x'})
+    async with session:
+        assert session.page.url.startswith('https://anyrouter.top')
+
+
+@pytest.mark.asyncio
+async def test_offsite_abort_still_fails(monkeypatch):
+    from playwright.async_api import Error as PlaywrightError
+    import backend.engine as adapter
+    from backend.providers import PROVIDERS
+
+    class FakePage:
+        url = 'about:blank'
+
+        async def goto(self, url, **kwargs):
+            raise PlaywrightError('Page.goto: net::ERR_ABORTED at ' + url)
+
+    class FakeContext:
+        async def new_page(self):
+            return FakePage()
+
+        async def add_cookies(self, cookies):
+            pass
+
+    class FakeBrowser:
+        async def new_context(self):
+            return FakeContext()
+
+        async def close(self):
+            pass
+
+    async def fake_launch(**kwargs):
+        return FakeBrowser()
+
+    async def fake_prepare(page):
+        pass
+
+    monkeypatch.setattr(adapter, 'launch_async', fake_launch)
+    monkeypatch.setattr(adapter, 'prepare_browser_page', fake_prepare)
+
+    with pytest.raises(PlaywrightError, match='ERR_ABORTED'):
+        async with adapter.BrowserSession(PROVIDERS['anyrouter'], {'session': 'x'}):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_browser_startup_error_is_not_misreported_as_manual_required(db, monkeypatch):
+    import backend.engine as adapter
+    from types import SimpleNamespace
+
+    account_id = db.add_account(account())
+
+    async def fake_login(*args):
+        return SimpleNamespace(cookies={'session': 'x'}, api_user='123')
+
+    class BrokenSession:
+        def __init__(self, *args):
+            pass
+
+        async def __aenter__(self):
+            raise RuntimeError('browser startup failed')
+
+        async def __aexit__(self, *args):
+            pass
+
+    monkeypatch.setattr(adapter, 'login_with_credentials', fake_login)
+    monkeypatch.setattr(adapter, 'BrowserSession', BrokenSession)
+    result = await adapter.CheckinEngine().run(db.account(account_id), {'email': 'a', 'password': 'b'})
+
+    assert result['status'] == 'failed'
+    assert 'RuntimeError' in result['message']
+    assert '未确认签到结果' in result['message']
+
+
+@pytest.mark.asyncio
+async def test_destroyed_context_is_retried_once(monkeypatch):
+    """SPA 自身跳转会销毁执行上下文；重试一次即可，不把偶发跳转算成签到失败。"""
+    from playwright.async_api import Error as PlaywrightError
+    import backend.engine as adapter
+    from backend.providers import PROVIDERS
+
+    monkeypatch.setattr(adapter, 'SETTLE_STABLE', 0.0)
+    monkeypatch.setattr(adapter, 'SETTLE_TIMEOUT', 1.0)
+
+    class FakePage:
+        url = 'https://anyrouter.top/login'
+
+        def __init__(self):
+            self.calls = 0
+
+        async def evaluate(self, script, args):
+            self.calls += 1
+            if self.calls == 1:
+                raise PlaywrightError('Page.evaluate: Execution context was destroyed, most likely because of a navigation')
+            return {'status': 401, 'body': {'success': False}}
+
+        async def wait_for_load_state(self, *args, **kwargs):
+            return None
+
+    session = adapter.BrowserSession(PROVIDERS['anyrouter'], {'session': 'x'})
+    session.page = FakePage()
+    result = await session.request('/api/user/self', '1')
+
+    assert result == {'status': 401, 'body': {'success': False}}
+    assert session.page.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_unrelated_browser_error_is_not_retried(monkeypatch):
+    from playwright.async_api import Error as PlaywrightError
+    import backend.engine as adapter
+    from backend.providers import PROVIDERS
+
+    monkeypatch.setattr(adapter, 'SETTLE_STABLE', 0.0)
+    monkeypatch.setattr(adapter, 'SETTLE_TIMEOUT', 1.0)
+
+    class FakePage:
+        url = 'https://anyrouter.top/login'
+
+        def __init__(self):
+            self.calls = 0
+
+        async def evaluate(self, script, args):
+            self.calls += 1
+            raise PlaywrightError('Page.evaluate: Target closed')
+
+        async def wait_for_load_state(self, *args, **kwargs):
+            return None
+
+    session = adapter.BrowserSession(PROVIDERS['anyrouter'], {'session': 'x'})
+    session.page = FakePage()
+
+    with pytest.raises(PlaywrightError, match='Target closed'):
+        await session.request('/api/user/self', '1')
+    assert session.page.calls == 1
+
+
 def test_interrupted_task_recovers_honestly(db):
     account_id = db.add_account(account())
     run_id = db.begin_run(db.account(account_id), 'scheduled')

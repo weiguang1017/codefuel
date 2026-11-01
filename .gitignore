@@ -12,6 +12,7 @@ data/
 
 # 构建产物与临时物
 dist/
+dist-new/
 build/pyinstaller/
 build/.pyinstaller/
 build/pyinstaller-codefuel/
