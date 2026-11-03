@@ -15,5 +15,6 @@ def site_cookies(cookies, provider):
         if cookie.get('expires', -1) > 0 and cookie['expires'] <= time.time():
             continue
         result.append({k: v for k, v in cookie.items() if k in
-                       ('name', 'value', 'domain', 'path', 'expires', 'httpOnly', 'secure', 'sameSite')})
+                       ('name', 'value', 'domain', 'path', 'expires', 'httpOnly', 'secure', 'sameSite',
+                        'partitionKey', '_crHasCrossSiteAncestor')})
     return result

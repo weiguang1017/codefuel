@@ -14,6 +14,7 @@ from .providers import PROVIDERS
 from .quota import quota_snapshot
 from .cookies import site_cookies
 from .retry import RETRY_DELAYS, transient_error, transient_status
+from .proxy import browser_proxy, proxy_failure_message
 from .upstream_imports import (get_playwright_proxy, login_with_credentials, prepare_browser_page,
                                wait_for_waf_ready)
 
@@ -76,22 +77,26 @@ def classify_response(status_code, body):
 
 class BrowserSession:
     """Same-origin browser fetch; avoids TLS fingerprint rejection by the site WAF."""
-    def __init__(self, provider, cookies, site_cookie_cache=None):
+    def __init__(self, provider, cookies, site_cookie_cache=None, proxy=None):
         self.provider = provider
         self.cookies = cookies
         self.site_cookie_cache = site_cookies(site_cookie_cache or [], provider)
         self.browser = None
+        self.proxy = proxy
         self._last_request = 0.0
 
     async def __aenter__(self):
         from urllib.parse import urlparse
         launch_kwargs = {'headless': True}
-        proxy = get_playwright_proxy(use_proxy=self.provider.use_proxy)
+        direct = self.proxy is not None and self.proxy['server'] == 'direct://'
+        if direct:
+            launch_kwargs['args'] = ['--no-proxy-server']
+        proxy = get_playwright_proxy(use_proxy=self.provider.use_proxy) if self.proxy is None else None
         if proxy:
             launch_kwargs['proxy'] = proxy
         self.browser = await launch_async(**launch_kwargs)
         try:
-            context = await self.browser.new_context()
+            context = await self.browser.new_context(**({'proxy': self.proxy} if self.proxy is not None and not direct else {}))
             self.context = context
             if self.site_cookie_cache:
                 await context.add_cookies(self.site_cookie_cache)
@@ -225,10 +230,14 @@ class CheckinEngine:
         # retry boundary, so never repeat a login because a later read failed.
         may_retry = row['provider'] == 'agentrouter' and row['auth_mode'] == 'session'
         try:
+            proxy = browser_proxy(credentials.get('proxy'))
             if row['auth_mode'] == 'password':
-                login = await login_with_credentials(row['name'], provider, row['provider'], credentials['email'], credentials['password'])
+                login = await login_with_credentials(row['name'], provider, row['provider'], credentials['email'], credentials['password'],
+                                                      **({'proxy': proxy} if proxy is not None else {}))
                 if not login:
-                    result.update(status='manual_required', message='浏览器登录未通过，请检查账号密码或前往官网处理人机验证。')
+                    result.update(status='manual_required', message=('代理连接或网站登录未通过，请检查该账号的代理配置、账号密码或网站验证。'
+                                  if proxy is not None and proxy['server'] != 'direct://' else
+                                  '浏览器登录未通过，请检查账号密码或前往官网处理人机验证。'))
                     return result
                 cookies, api_user = login.cookies, login.api_user
                 if not api_user:
@@ -237,6 +246,8 @@ class CheckinEngine:
             else:
                 cookies, api_user = {'session': credentials['session']}, credentials['api_user']
             options = {'site_cookie_cache': credentials['site_cookies']} if credentials.get('site_cookies') else {}
+            if proxy is not None:
+                options['proxy'] = proxy
             async with BrowserSession(provider, cookies, **options) as client:
                 before = await self.user_info(client, provider, api_user)
                 if before.get('waf'):
@@ -304,7 +315,7 @@ class CheckinEngine:
             result.update(message='网络连接失败或站点页面加载超时，未确认签到结果；请检查网络或代理设置后重试。',
                           _retryable=may_retry and transient_error(exc))
         except Exception as exc:
-            result.update(status='failed', _retryable=may_retry and transient_error(exc), message=(
+            result.update(status='failed', _retryable=may_retry and transient_error(exc), message=proxy_failure_message(exc) or (
                 f'浏览器执行异常（{type(exc).__name__}），未确认签到结果；'
                 '请重试，若持续发生请导出日志反馈。'
             ))

@@ -145,6 +145,7 @@ async def login_with_credentials(
 	provider_name: str,
 	email: str,
 	password: str,
+	*, proxy: dict | None = None,
 ) -> BrowserLoginResult | None:
 	"""使用邮箱密码通过浏览器登录，返回 cookies 与拦截到的 api user id。"""
 	print(f'[PROCESSING] {account_name}: Logging in with email/password...')
@@ -169,9 +170,10 @@ async def login_with_credentials(
 	)
 
 	try:
-		context = await launch_login_context(settings, use_proxy=provider_config.use_proxy)
+		context = await launch_login_context(settings, use_proxy=provider_config.use_proxy,
+			**({'proxy_override': proxy} if proxy is not None else {}))
 	except Exception as e:
-		print(f'[FAILED] {account_name}: Browser launch failed: {e}')
+		print(f'[FAILED] Browser launch failed ({type(e).__name__})')
 		return None
 
 	page = None
@@ -227,7 +229,7 @@ async def login_with_credentials(
 		return BrowserLoginResult(cookies=all_cookies, api_user=api_user)
 
 	except Exception as e:
-		print(f'[FAILED] {account_name}: Error during login: {e}')
+		print(f'[FAILED] Error during login ({type(e).__name__})')
 		if page is not None:
 			await save_login_screenshot(page, provider_name, account_name, 'login-error')
 		await context.close()

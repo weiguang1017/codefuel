@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -15,6 +16,7 @@ from .engine import CheckinEngine, browser_available
 from .login_flow import LoginFlow, LoginConflict
 from .providers import PROVIDERS, BROWSER_METHODS, CREDENTIAL_METHODS, provider_catalog, supports
 from .paths import APP_NAME, APP_VERSION, resource_root
+from .proxy import ProxyConfig, normalize_proxy
 
 ROOT = resource_root()
 CSRF = secrets.token_urlsafe(24)
@@ -33,6 +35,7 @@ active = set()
 
 
 class AccountIn(BaseModel):
+    proxy: ProxyConfig | None = None
     name: str = Field(min_length=1, max_length=40)
     provider: str
     auth_mode: str = 'password'
@@ -67,6 +70,7 @@ class SettingsIn(BaseModel):
 
 
 class LoginIn(BaseModel):
+    proxy: ProxyConfig | None = None
     provider: str
     method: str = 'github'
     name: str | None = Field(default=None, max_length=40)
@@ -102,6 +106,15 @@ async def lifespan(app):
 
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION, lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+
+
+@app.exception_handler(RequestValidationError)
+async def invalid_request(request, error):
+    # FastAPI's default errors echo submitted inputs, including proxy passwords.
+    proxy_error = any('proxy' in item['loc'] for item in error.errors())
+    return JSONResponse(status_code=422, content={'detail': (
+        '代理配置无效：请检查协议、主机和端口；认证信息须单独填写，SOCKS5 仅支持无认证。'
+        if proxy_error else '请求信息不完整或格式无效。')})
 
 
 @app.middleware('http')
@@ -184,7 +197,8 @@ async def start_login(data: LoginIn):
         with store.lock:
             if data.account_id in queued or data.account_id in active:
                 raise LoginConflict('账号正在排队或运行，暂不能重新授权')
-            session = login_flow.start(data.provider, data.method, data.name, data.account_id, data.interval_hours)
+            options = {'proxy': data.proxy} if data.proxy is not None else {}
+            session = login_flow.start(data.provider, data.method, data.name, data.account_id, data.interval_hours, **options)
     except LookupError as error:
         raise HTTPException(404, str(error))
     except LoginConflict as error:
@@ -222,11 +236,16 @@ def health():
 
 @app.post('/api/accounts', status_code=201)
 def create_account(data: AccountIn):
-    return {'id': store.add_account(data.model_dump())}
+    try:
+        payload = data.model_dump()
+        payload['proxy'] = normalize_proxy(data.proxy)
+        return {'id': store.add_account(payload)}
+    except ValueError:
+        raise HTTPException(422, '代理认证信息不完整，请填写代理用户名和密码。') from None
 
 
 @app.put('/api/accounts/{account_id}')
-def update_account(account_id: int, request: Request, data: dict):
+async def update_account(account_id: int, request: Request, data: dict):
     with store.lock:
         row = store.account(account_id)
         if not row:
@@ -246,13 +265,19 @@ def update_account(account_id: int, request: Request, data: dict):
                 merged[key] = data[key]
         try:
             valid = AccountIn(**merged)
+            proxy = normalize_proxy(data.get('proxy'), old.get('proxy'))
         except ValueError:
             raise HTTPException(422, '账号信息不完整或格式无效')
         payload = valid.model_dump()
+        payload['proxy'] = proxy
+        payload['replace_credentials'] = (valid.auth_mode != row['auth_mode'] or
+                                          bool(data.get('session') or data.get('api_user')))
         if (data.get('session') or data.get('api_user')) and valid.auth_mode == 'session':
             payload['login_via'] = 'cookie'
         store.update_account(account_id, payload)
-        return {'ok': True}
+    if proxy != old.get('proxy', {'mode': 'default'}):
+        await login_flow.discard_browser_sessions(account_id)
+    return {'ok': True}
 
 
 @app.delete('/api/accounts/{account_id}')

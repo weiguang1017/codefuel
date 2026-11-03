@@ -68,4 +68,25 @@
 #modal .modal-actions .field-help{flex-basis:100%;text-align:right}
 #modal select:disabled{color:#526157;opacity:1;background:#f2f4f2;cursor:not-allowed}
 .toolbar,.filter-group{flex-wrap:wrap}
+.proxy-settings{padding:16px;margin:0 0 18px;background:#f7faf7;border:1px solid #e0e9e2;border-radius:9px}
+.proxy-settings>.field{margin-bottom:0}
+.proxy-settings .field-optional{font-size:10px;color:#87988d;font-weight:400;margin-left:7px}
+.proxy-settings .field-help{margin:3px 0 0;font-size:10px;color:#718077;line-height:1.65}
+#proxy-custom{border-top:1px solid #e0e9e2;margin-top:13px;padding-top:14px}
+.proxy-auth-toggle{display:flex;gap:8px;align-items:center;font-size:11px;color:#536e5d;margin-bottom:13px;cursor:pointer}
+.proxy-auth-toggle input{width:15px;height:15px;accent-color:var(--green)}
+.proxy-settings [hidden]{display:none!important}
+.proxy-settings .form-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+.proxy-settings .field input{min-width:0;width:100%;box-sizing:border-box}
+.account-proxy{display:block;font-size:9px;color:#95a398;margin-top:3px}
+.form-errors-summary{padding:10px 12px;margin-bottom:16px;border:1px solid #e3aaa5;border-radius:7px;background:#fff4f2;color:#a32e26;font-size:12px}
+.form-errors-summary[hidden]{display:none}
+.field-error{margin:2px 0 0!important;color:#ac3028;font-size:11px;line-height:1.6;overflow-wrap:anywhere}
+.field-invalid input[aria-invalid="true"],.field-invalid select[aria-invalid="true"]{border-color:#bf493e;background:#fffafa;box-shadow:0 0 0 2px #bf493e16}
+.field-invalid .platform-options{border:1px solid #bf493e;border-radius:9px;padding:4px}
+.proxy-auth-toggle.field-invalid{flex-wrap:wrap;color:#ac3028}
+.proxy-auth-toggle .field-error{flex-basis:100%}
+[aria-invalid="true"]{scroll-margin-block:28px}
+.platform-progress .detecting span{color:#526c97}
+@media(max-width:480px){.proxy-settings .form-grid{grid-template-columns:1fr;gap:0}}
 @media(max-width:480px){.platform-options{grid-template-columns:1fr}.platform-heading{align-items:flex-start}.platform-heading .panel-link{max-width:125px}.platform-progress li>div{flex-wrap:wrap}.referral-banner-links{flex-wrap:wrap}.heading-actions{flex-wrap:wrap}}

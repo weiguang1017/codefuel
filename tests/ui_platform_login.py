@@ -129,9 +129,20 @@ class API:
                     plan['poll_entered'].set()
                 if plan.get('hold_poll'):
                     await plan['hold_poll'].wait()
+                if session.get('upstream_polls', 0) < plan.get('upstream_wait_polls', 0):
+                    session['upstream_polls'] = session.get('upstream_polls', 0) + 1
+                    return await route.fulfill(json={'id': sid, 'status': 'waiting', 'verification_paused': False,
+                                                     'verification_auto': True, 'stage': 'waiting_upstream',
+                                                     'message': '正在等待 LinuxDO 完成真人验证并返回目标平台；回跳后自动保存。'})
                 if session['verification_paused']:
-                    return await route.fulfill(json={'id': sid, 'status': 'waiting', 'verification_paused': True,
-                                                     'message': '请在当前登录窗口完成人工处理，然后重新校验。'})
+                    if plan.get('verification_auto') and session.get('auto_polls', 0) >= 2:
+                        session['verification_paused'] = False
+                    else:
+                        session['auto_polls'] = session.get('auto_polls', 0) + 1
+                        return await route.fulfill(json={'id': sid, 'status': 'waiting', 'verification_paused': True,
+                                                         'verification_auto': plan.get('verification_auto', False),
+                                                         'message': '请完成网站验证，应用将自动检测并保存。' if plan.get('verification_auto') else
+                                                                    '请在当前登录窗口完成人工处理，然后重新校验。'})
                 index = session['poll']
                 session['poll'] += 1
                 statuses = plan.get('statuses', ['waiting'])
@@ -199,7 +210,10 @@ async def cases(browser, base):
         assert await page.locator('[name="providers"]:checked').input_value() == 'anyrouter'
         assert await page.locator('[name="providers"]').count() == 2
         await page.locator('[name="providers"]').first.uncheck()
-        await expect(page.locator('#account-submit')).to_be_disabled()
+        await expect(page.locator('#account-submit')).to_be_enabled()
+        await page.locator('#account-submit').click()
+        await expect(page.locator('#field-error-providers')).to_have_text('请至少选择一个授权平台')
+        assert not api.starts
         await page.locator('[data-action="select-all-platforms"]').click()
         assert await page.locator('[name="providers"]:checked').count() == 2
         if method == 'github':

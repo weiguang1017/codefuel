@@ -39,6 +39,32 @@ async def test_notice_guard_closes_announcements_and_preserves_authentication():
 
 
 @pytest.mark.asyncio
+async def test_anyrouter_notice_can_discuss_authorization_without_being_consent():
+    if not LOCAL_CHROME: pytest.skip('Local Chrome is required')
+    html = '''<meta charset="utf-8">
+      <div class="semi-modal-content" id="notice"><div class="semi-modal-title">系统公告</div>
+        <p>请了解 API 授权方式与权限说明。</p><button onclick="window.persisted=true">今日关闭</button>
+        <button onclick="this.parentElement.remove()">关闭公告</button></div>
+      <div role="dialog" id="info"><h2>温馨提示</h2><p>操作已完成</p><button onclick="this.parentElement.remove()">确定</button></div>
+      <div role="dialog" id="danger"><h2>提示</h2><p>是否删除账号？</p><button onclick="this.parentElement.remove()">确定</button></div>
+      <div role="dialog" id="consent"><h2>提示</h2><p>授权访问你的账号信息</p><button onclick="this.parentElement.remove()">关闭</button></div>'''
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(executable_path=LOCAL_CHROME, headless=True)
+        try:
+            context = await browser.new_context()
+            await context.route('**/*', lambda route: route.fulfill(content_type='text/html', body=html))
+            await setup_notice_guard(context, 'https://anyrouter.top')
+            page = await context.new_page()
+            await page.goto('https://anyrouter.top/login')
+            await page.wait_for_function('!document.querySelector("#notice")&&!document.querySelector("#info")')
+            assert not await page.evaluate('!!window.persisted')
+            assert await page.locator('#danger').count() == 1
+            assert await page.locator('#consent').count() == 1
+        finally:
+            await browser.close()
+
+
+@pytest.mark.asyncio
 async def test_linuxdo_notice_that_becomes_visible_is_closed_but_consent_remains():
     if not LOCAL_CHROME:
         pytest.skip('Local Chrome is required')

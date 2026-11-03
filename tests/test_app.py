@@ -1522,7 +1522,8 @@ async def test_non_json_pause_only_saves_after_resumed_fresh_verification(db, is
         assert view['stage'] == 'verification_blocked'
         assert view['verification_paused'] is True
         assert view['account_id'] is None
-        assert '暂停自动请求' in view['message']
+        assert '自动检测并保存' in view['message']
+        assert view['verification_auto'] is True
         assert 'isolated-profile-cookie' not in json.dumps(view)
         for _ in range(3):
             await asyncio.sleep(0)
@@ -2361,10 +2362,15 @@ async def test_browser_restores_first_party_cookie_metadata_before_bootstrap(mon
 
 
 @pytest.mark.asyncio
-async def test_login_success_with_guarded_balance_keeps_window_until_user_verifies(db, monkeypatch):
+@pytest.mark.parametrize('existing', [False, True])
+async def test_login_success_with_guarded_balance_saves_authorization_without_waiting(db, monkeypatch, existing):
     import backend.login_flow as login
     flow = login.LoginFlow(db)
     session = login.LoginSession('agentrouter', 'linuxdo', 'fixture')
+    if existing:
+        i = db.add_account(account(provider='agentrouter', auth_mode='session', session='old', api_user='7'))
+        db.patch(i, balance=100, used_quota=5, total_quota=105, has_snapshot=1)
+        session.account_id = session.account = i
     flow.sessions[session.id] = session
     page = SimpleNamespace(url='https://agentrouter.org/console')
     cookies = [{'name': 'session', 'value': 'verified', 'domain': 'agentrouter.org', 'path': '/'},
@@ -2372,30 +2378,21 @@ async def test_login_success_with_guarded_balance_keeps_window_until_user_verifi
                {'name': 'upstream', 'value': 'upstream-verified', 'domain': '.linux.do', 'path': '/'}]
     context = FakeContext([page], cookies=AsyncMock(return_value=cookies))
     evidence = SimpleNamespace(changed=asyncio.Event(), get=AsyncMock(return_value=None))
-    verify = AsyncMock(side_effect=[login.ProfileVerificationBlocked(),
-                                   {'id': 7, 'quota': 60000000, 'used_quota': 2500000}])
+    verify = AsyncMock(side_effect=login.ProfileVerificationBlocked())
     monkeypatch.setattr(login, 'verify_target_profile', verify)
-    task = asyncio.create_task(flow._complete_login(session,
-        {'id': 7, '_login_response': True, 'checked_in': True}, 'verified', context, evidence))
-    try:
-        for _ in range(80):
-            if session.verification_paused: break
-            await asyncio.sleep(.02)
-        assert session.verification_paused
-        assert not task.done()
-        assert db.accounts() == []
-        assert verify.await_count == 1
-        assert flow.resume_verification(session.id)
-        await asyncio.wait_for(task, 2)
-        row = db.account(session.account)
-        assert session.status == 'success'
-        assert row['balance'] == 120
-        assert db.credentials(row)['site_cookies'] == [cookies[1]]
-        assert db.credentials(row)['oauth_cookies'] == [cookies[2]]
-        assert 'site-verified' not in json.dumps(db.dashboard())
-    finally:
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+    await asyncio.wait_for(flow._complete_login(session,
+        {'id': 7, '_login_response': True, 'checked_in': True, 'quota': 0, 'used_quota': 0},
+        'verified', context, evidence), 3)
+    row = db.account(session.account)
+    assert session.status == 'success'
+    assert not session.verification_paused and not session.verification_auto
+    assert row['balance'] == (100 if existing else None)
+    assert row['has_snapshot'] == int(existing)
+    assert db.credentials(row)['session'] == 'verified'
+    assert db.credentials(row)['site_cookies'] == [cookies[1]]
+    assert db.credentials(row)['oauth_cookies'] == [cookies[2]]
+    assert 'site-verified' not in json.dumps(db.dashboard())
+    verify.assert_awaited_once()
 
 
 @pytest.mark.asyncio

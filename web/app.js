@@ -9,11 +9,11 @@ const providerName = id => esc(providers().find(p=>p.id===id)?.name || id || '�
 const isOAuth = method => ['github','linuxdo'].includes(method);
 const isBrowser = method => isOAuth(method) || method==='manual';
 const money = n => n == null ? '—' : `$${Number(n).toFixed(2)}`;
-const authLabel = a => a.auth_mode === 'password' ? '邮箱密码'
+const authLabel = a => (a.auth_mode === 'password' ? '邮箱密码'
   : a.login_via === 'github' ? 'GitHub 授权'
   : a.login_via === 'linuxdo' ? 'LinuxDO 授权'
   : a.login_via === 'manual' ? '浏览器登录'
-  : 'Session';
+  : 'Session') + `<small class="account-proxy">${a.proxy?.mode==='custom'?'自定义代理':a.proxy?.mode==='direct'?'直连':'默认网络'}</small>`;
 const state = {data:null, view:'overview', filter:'all', query:'', editing:null, busy:false, loginMethod:'github', loginSession:null, reauth:false, connecting:null, selectedProviders:[], loginQueue:null};
 let toastTimer, loginPoll;
 function toast(message){ const el=$('#toast'); el.textContent=message; el.classList.add('show'); clearTimeout(toastTimer); toastTimer=setTimeout(()=>el.classList.remove('show'),3300); }
@@ -81,7 +81,8 @@ function accountModal(account=null,connecting=null){
   state.loginMethod=account?accountMethod(account):connecting?connecting.login_via:'github';
   state.selectedProviders=[];
   modal(`<div class="modal-head"><div><h2>${account?'编辑账号':connecting?'连接其他平台':'添加账号'}</h2><p>${account?'平台不可修改；连接其他平台需要独立授权。':connecting?`沿用「${esc(connecting.name)}」的身份方式，不复制原平台 Cookie。`:'先选择登录方式，再选择要独立连接的平台。'}</p></div><button class="icon-button" data-action="close" aria-label="关闭">${icon('x')}</button></div>
-  <form id="account-form">
+  <form id="account-form" novalidate>
+    <div class="form-errors-summary" role="alert" hidden></div>
     <div class="field"><label>账号备注</label><input name="name" required maxlength="40" value="${esc((account||connecting)?.name||'')}" placeholder="例如：我的主账号"></div>
     <div class="field"><label>1 · 登录方式</label>
       <div class="login-methods">
@@ -93,11 +94,53 @@ function accountModal(account=null,connecting=null){
     </div>
     <div id="platform-picker"></div>
     <div class="field"><label>执行间隔</label><select name="interval_hours">${[3,6,12,24].map(h=>`<option value="${h}" ${((account||connecting)?.interval_hours||6)===h?'selected':''}>每 ${h} 小时</option>`).join('')}</select></div>
+    ${proxyFields(account?.proxy)}
     <div id="credentials"></div>
     <div class="notice">${icon('shield')}每个平台分别授权，Cookie 在本机加密保存。AgentRouter 同时保存该账号的授权会话，用于后台签到；不会收集 GitHub / LinuxDO 密码。</div>
     <div class="modal-actions">${account?`<button type="button" class="button ghost danger" data-action="delete" data-id="${account.id}" style="margin-right:auto">删除账号</button>`:''}<button type="button" class="button secondary" data-action="close">取消</button><button class="button primary" type="submit" id="account-submit"></button></div>
   </form>`);
   syncMethod();
+  syncProxy();
+}
+function proxyFields(proxy={mode:'default'}){
+  return `<section class="proxy-settings" aria-label="账号网络代理">
+    <div class="field"><label for="proxy-mode">网络代理 <span class="field-optional">仅用于此账号</span></label>
+      <select id="proxy-mode" name="proxy_mode"><option value="default" ${proxy.mode==='default'?'selected':''}>默认网络</option><option value="direct" ${proxy.mode==='direct'?'selected':''}>直连 · 不使用代理</option><option value="custom" ${proxy.mode==='custom'?'selected':''}>自定义代理</option></select>
+      <p id="proxy-hint" class="field-help"></p></div>
+    <div id="proxy-custom" hidden>
+      <div class="field"><label for="proxy-server">代理地址</label><input id="proxy-server" name="proxy_server" maxlength="2048" value="${esc(proxy.server||'')}" placeholder="http://127.0.0.1:7890" autocomplete="off" spellcheck="false"><small>支持 HTTP、HTTPS、SOCKS5，请填写协议、主机与端口。</small></div>
+      <label class="proxy-auth-toggle"><input type="checkbox" name="proxy_auth" ${proxy.has_auth?'checked':''}>代理需要用户名和密码</label>
+      <div id="proxy-auth-fields" class="form-grid" hidden>
+        <div class="field"><label for="proxy-username">代理用户名</label><input id="proxy-username" name="proxy_username" maxlength="300" autocomplete="off"></div>
+        <div class="field"><label for="proxy-password">代理密码</label><input id="proxy-password" name="proxy_password" type="password" maxlength="1000" autocomplete="new-password"></div>
+      </div>
+      <p class="field-help">授权登录、余额查询和签到共用此代理。切换网络出口后，网站可能要求重新授权。SOCKS5 仅支持无认证连接。</p>
+    </div>
+  </section>`;
+}
+function syncProxy(){
+  const mode=$('[name="proxy_mode"]');if(!mode)return;
+  const custom=mode.value==='custom',server=$('[name="proxy_server"]'),auth=$('[name="proxy_auth"]');
+  $('#proxy-custom').hidden=!custom;server.disabled=!custom;server.required=custom;auth.disabled=!custom;
+  const authenticated=custom&&auth.checked;
+  $('#proxy-auth-fields').hidden=!authenticated;
+  const saved=state.editing?.proxy;
+  const keep=!!saved?.has_auth&&server.value.trim().replace(/\/$/,'')===saved.server;
+  for(const key of ['username','password']){
+    const input=$(`[name="proxy_${key}"]`);input.disabled=!authenticated;input.required=authenticated&&!keep;
+    input.placeholder=keep?'已加密保存，留空保留':key==='username'?'填写代理用户名':'填写代理密码';
+  }
+  $('#proxy-hint').textContent=custom?'认证信息仅在本机加密保存。':mode.value==='direct'?'此账号的授权与签到直接连接网站。':'沿用平台原有网络设置；未配置环境代理时直接连接。';
+}
+function proxyPayload(form){
+  const data=Object.fromEntries(new FormData(form));
+  if(data.proxy_mode!=='custom')return {mode:data.proxy_mode||'default'};
+  const proxy={mode:'custom',server:(data.proxy_server||'').trim(),authenticate:!!data.proxy_auth};
+  if(proxy.authenticate){
+    if(data.proxy_username)proxy.username=data.proxy_username;
+    if(data.proxy_password)proxy.password=data.proxy_password;
+  }
+  return proxy;
 }
 function platformPicker(){
   const target=$('#platform-picker');if(!target)return;
@@ -113,11 +156,12 @@ function platformPicker(){
     target.innerHTML=`<div class="field"><div class="platform-heading"><label>2 · ${multiple?'选择平台（可多选）':'选择平台'}</label>${multiple&&eligible.length?'<button type="button" class="panel-link" data-action="select-all-platforms">选择全部适配平台</button>':''}</div>${multiple?`<div class="platform-options">${eligible.map(p=>`<label class="platform-option"><input type="checkbox" name="providers" value="${esc(p.id)}" ${state.selectedProviders.includes(p.id)?'checked':''}><span><b>${esc(p.name)}</b><small>已适配 · 登录时检测入口</small></span></label>`).join('')}</div>`:`<select name="provider">${eligible.map(p=>`<option value="${esc(p.id)}" ${state.selectedProviders.includes(p.id)?'selected':''}>${esc(p.name)}</option>`).join('')}</select>`}${eligible.length?`<p class="field-help">${multiple?'同一个身份可以连接多个平台，但必须逐个平台完成授权。已适配不代表当前站点已提供对应入口。':'此登录方式一次仅连接一个平台。'}</p>`:'<p class="field-help">当前没有适配此登录方式的可选平台。</p>'}</div>`;
   }
   updateAccountSubmit();
+  if($('#account-form')?.dataset.validationAttempted)validateAccountForm($('#account-form'),false);
 }
 function updateAccountSubmit(){
   const submit=$('#account-submit');if(!submit)return;
   const browser=isBrowser(state.loginMethod);
-  submit.disabled=!state.editing&&!state.selectedProviders.length;
+  submit.disabled=state.busy||(!state.editing&&!eligibleProviders().length);
   submit.textContent=browser?(state.editing?(state.reauth?'重新授权并保存':'保存修改'):`${isOAuth(state.loginMethod)?'开始逐平台授权':'打开登录窗口'}${isOAuth(state.loginMethod)?`（${state.selectedProviders.length}）`:''}`):(state.editing?'保存修改':'添加账号');
 }
 function syncMethod(){
@@ -128,6 +172,7 @@ function syncMethod(){
   });
   platformPicker();
   credentialFields(state.loginMethod,!!state.editing);
+  if($('#account-form')?.dataset.validationAttempted)validateAccountForm($('#account-form'),false);
 }
 function credentialFields(method,editing=false){
   const f=$('#credentials');if(!f)return;
@@ -144,10 +189,55 @@ function credentialFields(method,editing=false){
   f.innerHTML=`<div class="field"><label>Session Cookie</label><input name="session" type="password" maxlength="8000" placeholder="${preserve?'留空则保留原 Session':'仅填写当前平台 session 的值'}" ${preserve?'':'required'} autocomplete="off"></div><div class="field"><label>API User</label><input name="api_user" ${preserve?'':'required'} maxlength="100" placeholder="${preserve?'留空则保留原值':'当前平台请求头 new-api-user 的值'}"></div><div class="notice">${icon('info')}切换为 Session 需要填写此平台的新凭据，不会复用其他认证方式或其他平台的 Cookie。</div>`;
 }
 function settingsModal(){const s=state.data.settings;modal(`<div class="modal-head"><div><h2>定时设置</h2><p>任务由本地后台执行，关闭此页面不会中断。</p></div><button class="icon-button" data-action="close">${icon('x')}</button></div><form id="settings-form"><div class="settings-line"><div><b>启用自动签到</b><p>仅为已启用的账号安排定时任务</p></div><button type="button" class="switch ${s.scheduler_enabled?'on':''}" data-action="modal-switch"></button></div><div class="settings-line"><div><b>统一执行间隔</b><p>保存后将应用到所有账号</p></div><select name="interval_hours">${[3,6,12,24].map(h=>`<option value="${h}" ${s.interval_hours===h?'selected':''}>每 ${h} 小时</option>`).join('')}</select></div><input type="hidden" name="scheduler_enabled" value="${s.scheduler_enabled}"><div class="notice" style="margin-top:20px">${icon('info')}电脑关机、休眠或退出后台后无法执行；恢复运行时会补做一次到期任务。站点可能尚未到领取时间，此时会记录为「已签到」。</div><div class="modal-actions"><button type="button" class="button secondary" data-action="close">取消</button><button class="button primary" type="submit">保存设置</button></div></form>`);}
+function validateAccountForm(form,focus=true){
+  form.dataset.validationAttempted='true';
+  $$('.field-error',form).forEach(el=>el.remove());
+  $$('.field-invalid',form).forEach(el=>el.classList.remove('field-invalid'));
+  $$('[aria-invalid]',form).forEach(el=>{el.removeAttribute('aria-invalid');el.removeAttribute('aria-describedby');});
+  const names={name:'账号备注',email:'登录邮箱',password:'登录密码',session:'Session Cookie',api_user:'API User',
+    proxy_server:'代理地址',proxy_username:'代理用户名',proxy_password:'代理密码'};
+  const errors=[];
+  for(const input of $$('input,select',form)){
+    if(!input.willValidate||input.type==='checkbox'||input.type==='hidden')continue;
+    const label=names[input.name]||'此项';
+    if(input.required&&!input.value.trim())errors.push([input,`请填写${label}`]);
+    else if(input.validity.typeMismatch)errors.push([input,`请输入有效的${label}`]);
+    else if(!input.validity.valid)errors.push([input,`请检查${label}的格式或范围`]);
+  }
+  const mode=$('[name="proxy_mode"]',form),server=$('[name="proxy_server"]',form);
+  if(mode?.value==='custom'&&server.value.trim()){
+    const address=server.value.trim();
+    const match=address.match(/^(https?|socks5):\/\/(?:\[[0-9a-f:]+\]|[^/?#:@\\\s]+):(\d+)\/?$/i);
+    if(!match||Number(match[2])<1||Number(match[2])>65535){
+      if(!errors.some(([input])=>input===server))errors.push([server,'请填写有效代理地址，如 http://127.0.0.1:7890；认证信息请单独填写']);
+    }else if(match[1].toLowerCase()==='socks5'&&$('[name="proxy_auth"]',form).checked){
+      errors.push([$('[name="proxy_auth"]',form),'SOCKS5 仅支持无认证；需要用户名密码时请选择 HTTP/HTTPS 代理']);
+    }
+  }
+  if(!state.selectedProviders.length){
+    const target=$('[name="providers"],[name="provider"]',form)||$('#platform-picker');
+    errors.push([target,'请至少选择一个授权平台']);
+  }
+  errors.sort((a,b)=>a[0]===b[0]?0:(a[0].compareDocumentPosition(b[0])&Node.DOCUMENT_POSITION_FOLLOWING?-1:1));
+  for(const [input,message] of errors){
+    const parent=input.closest('.proxy-auth-toggle')||input.closest('.field')||input;
+    parent.classList.add('field-invalid');
+    const id=`field-error-${input.name||'platform'}`;
+    const help=document.createElement('p');help.className='field-error';help.id=id;help.textContent=message;
+    parent.appendChild(help);input.setAttribute('aria-invalid','true');input.setAttribute('aria-describedby',id);
+  }
+  const summary=$('.form-errors-summary',form);
+  summary.hidden=!errors.length;summary.textContent=errors.length?`请完善标红的 ${errors.length} 项信息后继续。`:'';
+  if(focus&&errors.length){
+    const first=errors[0][0];first.scrollIntoView({block:'center',behavior:'instant'});first.focus({preventScroll:true});
+  }
+  return !errors.length;
+}
 async function saveAccount(form){
   if(state.busy)return;
   state.busy=true;
   try{
+    if(!validateAccountForm(form))return;
     const data=Object.fromEntries(new FormData(form));
     const method=state.loginMethod,editing=state.editing;
     const name=(data.name||'').trim();
@@ -155,10 +245,11 @@ async function saveAccount(form){
     const selected=editing?[editing.provider]:state.selectedProviders;
     if(!selected.length)throw new Error('请至少选择一个平台');
     if(isBrowser(method)&&(!editing||state.reauth)){
-      return launchLogin({method,interval_hours:Number(data.interval_hours),name,account_id:editing?.id||null},selected);
+      return launchLogin({method,interval_hours:Number(data.interval_hours),name,account_id:editing?.id||null,proxy:proxyPayload(form)},selected);
     }
     const mode=method==='password'?'password':'session';
     const body={name,provider:editing?.provider||selected[0],auth_mode:mode,interval_hours:Number(data.interval_hours),enabled:editing?editing.enabled:true};
+    body.proxy=proxyPayload(form);
     if(!isBrowser(method))body.login_via=method;
     for(const k of ['password','session','api_user','email'])if(data[k])body[k]=data[k];
     await api(editing?`/api/accounts/${editing.id}`:'/api/accounts',{method:editing?'PUT':'POST',body});
@@ -175,12 +266,12 @@ function launchLogin(options,selected=[options.provider]){
 function renderLoginQueue(queue){
   if(state.loginQueue!==queue||queue.stopped)return;
   const item=queue.items[queue.index];
-  const statuses={pending:'等待',starting:'正在发起',waiting:'等待授权',blocked:'等待人工处理',success:'已保存',error:'未完成',network:'连接中断',unknown:'结果待确认',skipped:'已跳过'};
+  const statuses={pending:'等待',starting:'正在发起',waiting:'等待授权',detecting:'等待验证 · 自动检测',blocked:'等待人工处理',success:'已保存',error:'未完成',network:'连接中断',unknown:'结果待确认',skipped:'已跳过'};
   const finished=queue.items.filter(i=>i.status==='success').length;
   modal(`<div class="modal-head"><div><h2>${queue.done?'授权结果':`${methodName(queue.options.method)} · 逐平台授权`}</h2><p>${queue.done?`${finished} / ${queue.items.length} 个平台已独立保存`:`当前 ${queue.index+1} / ${queue.items.length} · ${providerName(item.provider)}`}；已完成的账号会保留。</p></div><button class="icon-button" data-action="close" aria-label="关闭">${icon('x')}</button></div>
     <ol class="platform-progress" aria-live="polite">${queue.items.map((entry,index)=>`<li class="${esc(entry.status)} ${index===queue.index&&!queue.done?'current':''}"><div><b>${providerName(entry.provider)}</b><span>${statuses[entry.status]||esc(entry.status)}</span></div><p>${esc(entry.message)}</p></li>`).join('')}</ol>
     ${!queue.done?`<div class="notice">${icon('info')}每个平台分别在浏览器中授权。入口不可用时可跳过；取消或关闭会停止整个队列，不撤销已保存账号。</div>`:''}
-    <div class="modal-actions">${queue.done?'<button class="button primary" data-action="close">完成</button>':`<button class="button secondary" data-action="cancel-login">取消全部</button>${item.status==='error'?'<button class="button secondary" data-action="skip-login">跳过此平台</button><button class="button primary" data-action="retry-login">重试此平台</button>':''}${item.status==='blocked'?'<button class="button primary" data-action="resume-login">我已处理，重新校验</button>':''}${item.status==='network'?'<button class="button primary" data-action="retry-poll">重试查询当前授权</button>':''}${item.status==='unknown'?'<span class="field-help">为避免重复账号，不自动重新发起授权。</span>':''}`}</div>`);
+    <div class="modal-actions">${queue.done?'<button class="button primary" data-action="close">完成</button>':`<button class="button secondary" data-action="cancel-login">取消全部</button>${item.status==='error'?'<button class="button secondary" data-action="skip-login">跳过此平台</button><button class="button primary" data-action="retry-login">重试此平台</button>':''}${item.status==='blocked'?'<button class="button primary" data-action="resume-login">我已处理，重新校验</button>':''}${item.status==='detecting'&&item.canResume?'<button class="button secondary" data-action="resume-login">立即检测</button>':''}${item.status==='network'?'<button class="button primary" data-action="retry-poll">重试查询当前授权</button>':''}${item.status==='unknown'?'<span class="field-help">为避免重复账号，不自动重新发起授权。</span>':''}`}</div>`);
 }
 async function startQueueItem(queue){
   if(!queueActive(queue)||queue.starting)return;
@@ -224,7 +315,8 @@ async function pollLogin(queue){
       if(result.status==='unavailable')item.message=result.message||`平台不支持或未提供 ${methodName(queue.options.method)} 入口。`;
       renderLoginQueue(queue);return;
     }
-    item.status=result.verification_paused?'blocked':'waiting';renderLoginQueue(queue);
+    item.canResume=!!result.verification_paused;
+    item.status=result.verification_auto?'detecting':result.verification_paused?'blocked':'waiting';renderLoginQueue(queue);
     loginPoll=setTimeout(()=>pollLogin(queue),1000);
   }catch(error){
     if(!queueActive(queue))return;
@@ -280,8 +372,14 @@ document.addEventListener('click',async e=>{const btn=e.target.closest('button')
 document.addEventListener('submit',async e=>{e.preventDefault();const submit=e.submitter;if(submit)submit.disabled=true;try{if(e.target.id==='account-form')await saveAccount(e.target);if(e.target.id==='settings-form'){const body=Object.fromEntries(new FormData(e.target));body.scheduler_enabled=body.scheduler_enabled==='true';body.interval_hours=Number(body.interval_hours);await api('/api/settings',{method:'PATCH',body});closeModal();toast('定时设置已保存');await refresh(true);}}catch(err){toast(err.message);if(submit)submit.disabled=false;}});
 document.addEventListener('input',e=>{if(e.target.id==='account-search'){state.query=e.target.value;const pos=e.target.selectionStart;render();const input=$('#account-search');input.focus();input.setSelectionRange(pos,pos);}});
 document.addEventListener('change',e=>{
+  if(['proxy_mode','proxy_auth','proxy_server'].includes(e.target.name))syncProxy();
   if(e.target.name==='providers'){state.selectedProviders=$$('input[name="providers"]:checked').map(input=>input.value);updateAccountSubmit();}
   if(e.target.name==='provider'&&!state.editing){state.selectedProviders=[e.target.value];updateAccountSubmit();}
+});
+document.addEventListener('input',e=>{if(e.target.name==='proxy_server')syncProxy();});
+for(const event of ['input','change'])document.addEventListener(event,e=>{
+  const form=e.target.closest('#account-form');
+  if(form?.dataset.validationAttempted)validateAccountForm(form,false);
 });
 $('#modal').addEventListener('click',e=>{if(e.target===$('#modal'))closeModal();});
 $('#modal').addEventListener('cancel',e=>{e.preventDefault();closeModal();});

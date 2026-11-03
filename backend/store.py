@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from cryptography.fernet import Fernet, InvalidToken
 from .paths import DB_NAME, data_dir
+from .proxy import public_proxy
 
 DATA_DIR = data_dir()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -117,6 +118,7 @@ class Store:
                 'last_run', 'next_run', 'last_message', 'balance', 'used_quota', 'interval_hours')}
         data['enabled'] = bool(row['enabled'])
         data['login_via'] = row['login_via'] if 'login_via' in row.keys() else None
+        data['proxy'] = public_proxy(self.credentials(row).get('proxy'))
         return data
 
     def accounts(self, enabled_only=False):
@@ -127,7 +129,7 @@ class Store:
         return self.db.execute('SELECT * FROM accounts WHERE id=?', (account_id,)).fetchone()
 
     def add_account(self, data):
-        encrypted = self.encrypt_credentials({k: data[k] for k in ('email', 'password', 'session', 'api_user', 'oauth_cookies', 'site_cookies', 'oauth_user_agent') if data.get(k)})
+        encrypted = self.encrypt_credentials({k: data[k] for k in ('email', 'password', 'session', 'api_user', 'oauth_cookies', 'site_cookies', 'oauth_user_agent', 'proxy') if data.get(k)})
         now = utcnow()
         with self.lock:
             cur = self.db.execute('INSERT INTO accounts (name,provider,auth_mode,encrypted,enabled,interval_hours,next_run,created_at,login_via) VALUES(?,?,?,?,?,?,?,?,?)',
@@ -137,7 +139,7 @@ class Store:
             return cur.lastrowid
 
     def apply_login(self, account_id, session, api_user, login_via, balance=None, used_quota=None, *, provider,
-                    name=None, interval_hours=None, oauth_cookies=None, site_cookies=None, oauth_user_agent=None):
+                    name=None, interval_hours=None, oauth_cookies=None, site_cookies=None, oauth_user_agent=None, proxy=None):
         """保存前再次核对平台、运行状态和已有站点身份。"""
         with self.lock:
             row = self.account(account_id)
@@ -147,11 +149,14 @@ class Store:
                 raise ValueError('重新授权的平台与原账号不一致，登录状态未保存。')
             if row['status'] in ('queued', 'running'):
                 raise ValueError('账号正在排队或运行，登录状态未保存。')
-            previous_user = self.credentials(row).get('api_user')
+            previous_credentials = self.credentials(row)
+            previous_user = previous_credentials.get('api_user')
             if previous_user is not None and str(previous_user) != str(api_user):
                 raise ValueError('本次授权身份与原账号不同，请单独添加账号，登录状态未保存。')
             updates = {'auth_mode': 'session',
                        'encrypted': self.encrypt_credentials({'session': session, 'api_user': str(api_user),
+                                                              **({'proxy': proxy} if proxy is not None else
+                                                                 ({'proxy': previous_credentials['proxy']} if 'proxy' in previous_credentials else {})),
                                                               **({'site_cookies': site_cookies} if site_cookies else {}),
                                                               **({'oauth_user_agent': oauth_user_agent} if oauth_user_agent else {}),
                                                               'oauth_cookies': oauth_cookies or []}),
@@ -177,13 +182,16 @@ class Store:
             if row['status'] in ('queued', 'running'):
                 raise ValueError('任务运行中，暂不能编辑')
             old = self.credentials(row)
+            proxy = data.get('proxy', old.get('proxy'))
             for key in ('email', 'password', 'session', 'api_user'):
                 if data.get(key):
                     old[key] = data[key]
-            if data.get('auth_mode') == 'session':
+            if data.get('auth_mode') == 'session' and data.get('replace_credentials', True):
                 old = {'session': old['session'], 'api_user': old['api_user']}
             elif data.get('auth_mode') == 'password':
                 old = {k: old[k] for k in ('email', 'password') if old.get(k)}
+            if proxy is not None:
+                old['proxy'] = proxy
             login_via = data.get('login_via', row['login_via'])
             if data.get('auth_mode') == 'password':
                 login_via = None

@@ -2,6 +2,8 @@
 import asyncio
 import re
 import secrets
+import hashlib
+import json
 import time
 from playwright.async_api import Error as PlaywrightError
 from urllib.parse import urljoin, urlparse, parse_qs
@@ -13,6 +15,7 @@ from .providers import PROVIDERS, BROWSER_METHODS, supports
 from .quota import quota_snapshot
 from .cookies import site_cookies
 from .browser_identity import chrome_user_agent
+from .proxy import normalize_proxy, browser_proxy, proxy_failure_message
 from .popups import setup_notice_guard
 from .retry import RETRY_DELAYS, transient_error, transient_status
 from .upstream_imports import prepare_browser_page, wait_for_waf_ready, get_playwright_proxy
@@ -27,6 +30,7 @@ OAUTH_BUTTONS = {
 }
 OAUTH_ENTRY_TIMEOUT = 12
 UPSTREAM_VERIFICATION_GRACE = 20
+VERIFICATION_RECHECK_DELAYS = (8.0, 15.0, 30.0)
 ACTIVE_STATUSES = ('starting', 'waiting', 'verifying')
 
 
@@ -229,6 +233,7 @@ class LoginSession:
         self.task = None
         self.stage = 'opening'
         self.verification_paused = False
+        self.verification_auto = False
         self.resume_event = asyncio.Event()
 
 
@@ -247,7 +252,7 @@ class LoginFlow:
         return any(s.account_id == account_id and s.status in ACTIVE_STATUSES
                    for s in self.sessions.values())
 
-    def start(self, provider, method, name, account_id=None, interval_hours=6):
+    def start(self, provider, method, name, account_id=None, interval_hours=6, *, proxy=None):
         if provider not in PROVIDERS:
             raise ValueError('未支持的平台')
         if method not in BROWSER_METHODS or not supports(provider, method):
@@ -255,6 +260,7 @@ class LoginFlow:
         if method in OAUTH_LABELS and not name and account_id is None:
             raise ValueError('请先填写账号备注')
         with self.store.lock:
+            previous_proxy = None
             current = self.sessions.get(self.active_id)
             if current and current.status in ACTIVE_STATUSES and time.time() - current.created >= WINDOW_TIMEOUT + 30:
                 current.status, current.message = 'expired', '登录窗口已超时关闭。'
@@ -268,9 +274,11 @@ class LoginFlow:
                     raise LoginConflict('重新授权的平台必须与原账号一致')
                 if row['status'] in ('queued', 'running') or self.is_authorizing(account_id):
                     raise LoginConflict('账号正在排队、运行或授权，暂不能重新授权')
+                previous_proxy = self.store.credentials(row).get('proxy')
             if current and current.status in ACTIVE_STATUSES:
                 raise LoginConflict('已有登录窗口正在等待完成，请先完成或取消它。')
             session = LoginSession(provider, method, name, account_id, interval_hours)
+            session.account_proxy = normalize_proxy(proxy, previous_proxy)
             self.sessions[session.id] = session
             self.active_id = session.id
             self._prune()
@@ -284,7 +292,8 @@ class LoginFlow:
         return {'id': session.id, 'provider': session.provider, 'method': session.method,
                 'status': session.status, 'message': session.message,
                 'account_id': session.account, 'elapsed': int(time.time() - session.created),
-                'stage': session.stage, 'verification_paused': session.verification_paused}
+                'stage': session.stage, 'verification_paused': session.verification_paused,
+                'verification_auto': session.verification_auto}
 
     def resume_verification(self, session_id):
         session = self.sessions.get(session_id)
@@ -362,6 +371,7 @@ class LoginFlow:
         session.checkin_background = True
         session.checkin_require_login_response = True
         session.oauth_cookies = cached
+        session.account_proxy = credentials.get('proxy', {'mode': 'default'})
         session.oauth_user_agent = credentials.get('oauth_user_agent')
         session.site_cookies = site_cookies(credentials.get('site_cookies', []), PROVIDERS[row['provider']])
         session.checkin_result = None
@@ -416,10 +426,13 @@ class LoginFlow:
             if session.cancelled or session.status not in ACTIVE_STATUSES:
                 return
             background = getattr(session, 'checkin_background', False)
+            account_proxy = browser_proxy(getattr(session, 'account_proxy', None))
+            inherited_proxy = get_playwright_proxy(use_proxy=provider.use_proxy) if account_proxy is None else None
             # Both OAuth providers use a truly headless, account-isolated browser.
             # Minimizing a headed window still briefly exposes it at startup.
             if background and session.provider == 'agentrouter':
-                cache_key = (session.account_id, session.provider, session.method, session.checkin_identity)
+                routing = hashlib.sha256(json.dumps(account_proxy or inherited_proxy, sort_keys=True).encode()).hexdigest()
+                cache_key = (session.account_id, session.provider, session.method, session.checkin_identity, routing)
             if not background and session.account_id is not None:
                 await self.discard_browser_sessions(session.account_id)
                 row = self.store.account(session.account_id)
@@ -428,9 +441,11 @@ class LoginFlow:
                     session.oauth_cookies = self._oauth_cookies(credentials.get('oauth_cookies', []), session.method)
                     session.site_cookies = site_cookies(credentials.get('site_cookies', []), provider)
             launch_options = {'headless': background}
-            proxy = get_playwright_proxy(use_proxy=provider.use_proxy)
-            if proxy:
-                launch_options['proxy'] = proxy
+            direct = account_proxy is not None and account_proxy['server'] == 'direct://'
+            if direct:
+                launch_options['args'] = ['--no-proxy-server']
+            if inherited_proxy:
+                launch_options['proxy'] = inherited_proxy
             cached_browser = self.browser_sessions.pop(cache_key, None) if cache_key else None
             if cached_browser:
                 browser, context, page = cached_browser
@@ -440,9 +455,15 @@ class LoginFlow:
             if browser is None:
                 browser = await asyncio.wait_for(launch_async(**launch_options), timeout=90)
                 context_options = {'viewport': None}
+                if account_proxy is not None and not direct:
+                    context_options['proxy'] = account_proxy
                 if session.provider == 'agentrouter' and session.method == 'linuxdo':
                     session.oauth_user_agent = await chrome_user_agent(browser, getattr(session, 'oauth_user_agent', None))
-                    context_options['user_agent'] = session.oauth_user_agent
+                    # Keep interactive Chrome native. Even an identical UA
+                    # override makes Playwright synthesize incorrect Client Hints
+                    # (e.g. x86 / 10_15_7 on an Apple Silicon Mac).
+                    if background:
+                        context_options['user_agent'] = session.oauth_user_agent
                 context = await browser.new_context(**context_options)
                 if session.method == 'linuxdo':
                     await setup_notice_guard(context, provider.domain,
@@ -548,6 +569,11 @@ class LoginFlow:
                     session.message = '正在后台复用授权会话；需要手动登录或验证时将停止。'
                     await asyncio.sleep(1.5)
                     continue
+                if (self._upstream_auth_pending(session, context)
+                        or self._oauth_return_pending(session, context, provider)):
+                    self._show_upstream_wait(session)
+                    await asyncio.sleep(1.5)
+                    continue
                 cookie = await self._session_cookie(context, provider)
                 target_pages = [p for p in context.pages if _origin(p.url) == _origin(provider.domain)]
                 if cookie and target_pages:
@@ -559,36 +585,11 @@ class LoginFlow:
                         try:
                             profile = await verify_target_profile(target_page, provider)
                         except ProfileVerificationBlocked:
-                            session.status = 'waiting'
-                            session.stage = 'verification_blocked'
-                            session.verification_paused = True
-                            session.resume_event.clear()
-                            session.message = ('目标平台账号接口返回防护页面或拒绝访问，尚未确认账号身份；已暂停自动请求。'
-                                               '请在当前窗口手动处理网站验证，再点击「我已处理，重新校验」。'
-                                               '仅登录 LinuxDO/GitHub 不代表已完成目标平台授权。')
-                            while True:
-                                resume = asyncio.create_task(session.resume_event.wait())
-                                observed = asyncio.create_task(evidence.changed.wait())
-                                try:
-                                    done, _ = await asyncio.wait({resume, observed},
-                                        timeout=max(0.1, deadline - time.monotonic()),
-                                        return_when=asyncio.FIRST_COMPLETED)
-                                    if not done:
-                                        session.status, session.message = 'expired', '等待人工处理已超时；未取得目标平台有效授权响应，未保存账号。'
-                                        return
-                                    evidence.changed.clear()
-                                    captured = await evidence.get()
-                                    if captured:
-                                        await self._complete_login(session, *captured, context, evidence)
-                                        return
-                                    if resume in done:
-                                        break
-                                finally:
-                                    for waiter in (resume, observed):
-                                        if not waiter.done():
-                                            waiter.cancel()
-                                    await asyncio.gather(resume, observed, return_exceptions=True)
-                            break
+                            session.profile_recheck_after = time.monotonic() + VERIFICATION_RECHECK_DELAYS[0]
+                            captured = await self._wait_verified_profile(session, context, evidence, deadline)
+                            if captured:
+                                await self._complete_login(session, *captured, context, evidence)
+                            return
                         except PlaywrightError as exc:
                             if 'Execution context was destroyed' not in str(exc):
                                 raise
@@ -619,7 +620,7 @@ class LoginFlow:
             if session.status in ACTIVE_STATUSES:
                 session.status = 'failed'
                 session.retryable = getattr(session, 'checkin_background', False) and transient_error(exc)
-                session.message = ('后台连接中断或页面加载超时，已保留登录缓存，请稍后重试。' if session.retryable else
+                session.message = proxy_failure_message(exc) or ('后台连接中断或页面加载超时，已保留登录缓存，请稍后重试。' if session.retryable else
                                    '登录未能完成，请重试，或主动重新授权。')
         finally:
             if evidence:
@@ -697,8 +698,47 @@ class LoginFlow:
             if cookie.get('expires', -1) > 0 and cookie['expires'] <= time.time():
                 continue
             allowed.append({k: v for k, v in cookie.items() if k in
-                            ('name', 'value', 'domain', 'path', 'expires', 'httpOnly', 'secure', 'sameSite')})
+                            ('name', 'value', 'domain', 'path', 'expires', 'httpOnly', 'secure', 'sameSite',
+                             'partitionKey', '_crHasCrossSiteAncestor')})
         return allowed
+
+    @staticmethod
+    def _upstream_auth_pending(session, context):
+        """A target site's anonymous OAuth-state cookie is not a completed SSO login."""
+        methods = OAUTH_LABELS if session.method == 'manual' else (session.method,)
+        for page in context.pages:
+            location = urlparse(page.url)
+            if location.scheme != 'https' or location.port not in (None, 443):
+                continue
+            path = location.path.rstrip('/')
+            if ('linuxdo' in methods and location.hostname in ('linux.do', 'connect.linux.do')
+                    and any(path == route or path.startswith(route + '/')
+                            for route in ('/login', '/session', '/sessions', '/oauth2', '/auth', '/challenge'))):
+                return True
+            if ('github' in methods and location.hostname == 'github.com'
+                    and any(path == route or path.startswith(route + '/')
+                            for route in ('/login', '/session', '/sessions', '/two-factor', '/sudo'))):
+                return True
+        return False
+
+    @staticmethod
+    def _oauth_return_pending(session, context, provider):
+        if session.method not in OAUTH_LABELS:
+            return False
+        # The popup may still be about:blank before its first SSO navigation.
+        # Do not probe the opener's anonymous OAuth-state session on /login.
+        return not any(_origin(page.url) == _origin(provider.domain)
+                       and urlparse(page.url).path.rstrip('/') not in (provider.login_path.rstrip('/'), '/register')
+                       for page in context.pages)
+
+    @staticmethod
+    def _show_upstream_wait(session):
+        label = OAUTH_LABELS.get(session.method, '身份提供方')
+        session.status, session.stage = 'waiting', 'waiting_upstream'
+        session.verification_paused = False
+        session.verification_auto = True
+        session.message = (f'正在等待 {label} 完成登录或真人验证并返回目标平台；回跳后会自动检测和保存。'
+                           '若验证反复出现，请取消本次授权，检查该账号的代理或网络后重试。')
 
     async def _background_auth_blocked(self, session, context, blocked_documents):
         for page in context.pages:
@@ -736,19 +776,21 @@ class LoginFlow:
                 # Keep the explicit check-in flag, but fetch money from /user/self.
                 # A failed balance refresh must not discard a valid new session.
                 checked = profile.get('checked_in')
+                profile = {key: value for key, value in profile.items() if key not in ('quota', 'used_quota')}
                 for page in reversed(context.pages):
+                    if time.monotonic() < getattr(session, 'profile_recheck_after', 0):
+                        break
                     if _origin(page.url) != _origin(provider.domain):
                         continue
                     try:
                         await asyncio.sleep(1.2)
                         refreshed = await verify_target_profile(page, provider, profile['id'])
                     except ProfileVerificationBlocked:
-                        if not getattr(session, 'checkin_background', False) and evidence is not None:
-                            refreshed = await self._wait_login_balance(session, profile, cookie, context, evidence)
-                            if refreshed is None:
-                                return
-                        else:
-                            refreshed = None
+                        # The login response already proves identity and issued
+                        # this session cookie. Balance availability is independent:
+                        # save the authorization without placeholder/stale money.
+                        session.profile_recheck_after = time.monotonic() + VERIFICATION_RECHECK_DELAYS[0]
+                        break
                     except PlaywrightError:
                         refreshed = None
                     if refreshed and str(refreshed['id']) != str(profile['id']):
@@ -764,6 +806,7 @@ class LoginFlow:
                 session.oauth_cookies = self._oauth_cookies(await context.cookies(), session.method)
             session.site_cookies = site_cookies(await context.cookies([provider.domain]), provider)
         session.verification_paused = False
+        session.verification_auto = False
         session.stage = 'identity_confirmed'
         if hasattr(session, 'checkin_identity'):
             if str(profile['id']) != session.checkin_identity:
@@ -778,47 +821,68 @@ class LoginFlow:
         else:
             await self._persist(session, profile, cookie)
 
-    async def _wait_login_balance(self, session, profile, cookie, context, evidence):
-        """Keep explicit authorization open while the user completes the site's challenge."""
+    async def _wait_verified_profile(self, session, context, evidence, deadline):
+        """Observe completion immediately, with spaced same-origin identity reads as a fallback."""
         provider = PROVIDERS[session.provider]
         session.status, session.stage = 'waiting', 'verification_blocked'
         session.verification_paused = True
+        session.verification_auto = True
         session.resume_event.clear()
-        session.message = ('登录身份已确认，但余额接口需要网站验证。请在授权窗口打开控制台并完成验证，'
-                           '再点击「我已处理，重新校验」；当前不会用登录占位金额保存余额。')
-        deadline = time.monotonic() + WINDOW_TIMEOUT
+        session.message = ('请在授权窗口完成网站要求的验证；应用会自动检测并保存，无需返回点击确认。'
+                           '当前仍需确认目标平台的账号身份。')
+        attempts = 0
+        next_check = time.monotonic() + VERIFICATION_RECHECK_DELAYS[0]
         while time.monotonic() < deadline:
-            if session.cancelled or not context.pages:
+            if session.cancelled or session.status not in ACTIVE_STATUSES or not context.pages:
                 session.status, session.message = 'cancelled', '授权窗口已关闭，未保存本次登录。'
                 return None
             captured = await evidence.get()
             if captured:
-                current, current_cookie = captured
-                if (not current.get('_login_response') and quota_snapshot(current) is not None
-                        and current_cookie == cookie and str(current.get('id')) == str(profile['id'])):
-                    return current
+                return captured
+            if (self._upstream_auth_pending(session, context)
+                    or self._oauth_return_pending(session, context, provider)):
+                self._show_upstream_wait(session)
+                next_check = max(next_check, time.monotonic() + 1.5)
             resume = asyncio.create_task(session.resume_event.wait())
             changed = asyncio.create_task(evidence.changed.wait())
             try:
-                done, _ = await asyncio.wait({resume, changed}, timeout=1.5, return_when=asyncio.FIRST_COMPLETED)
+                await asyncio.wait({resume, changed}, timeout=min(1.0, max(.01, deadline - time.monotonic()),
+                                                                 max(.01, next_check - time.monotonic())),
+                                   return_when=asyncio.FIRST_COMPLETED)
                 evidence.changed.clear()
-                if resume in done:
+                captured = await evidence.get()
+                if captured:
+                    return captured
+                if (self._upstream_auth_pending(session, context)
+                        or self._oauth_return_pending(session, context, provider)):
+                    self._show_upstream_wait(session)
                     session.resume_event.clear()
+                    continue
+                if session.resume_event.is_set() or time.monotonic() >= next_check:
+                    session.resume_event.clear()
+                    session.verification_paused = False
+                    session.status, session.stage = 'verifying', 'verifying_target'
                     for page in reversed(context.pages):
                         if _origin(page.url) != _origin(provider.domain):
                             continue
+                        cookie = await self._session_cookie(context, provider)
+                        if not cookie:
+                            continue
                         try:
-                            current = await verify_target_profile(page, provider, profile['id'])
+                            current = await verify_target_profile(page, provider)
                         except (PlaywrightError, ProfileVerificationBlocked):
-                            current = None
-                        if current and quota_snapshot(current) is not None:
-                            return current
+                            break
+                        if current and cookie == await self._session_cookie(context, provider):
+                            return current, cookie
+                    attempts += 1
+                    next_check = time.monotonic() + VERIFICATION_RECHECK_DELAYS[min(attempts, len(VERIFICATION_RECHECK_DELAYS) - 1)]
+                    session.status, session.stage = 'waiting', 'verification_blocked'
                     session.verification_paused = True
             finally:
                 for task in (resume, changed):
                     task.cancel()
                 await asyncio.gather(resume, changed, return_exceptions=True)
-        session.status, session.message = 'expired', '等待网站验证超时，未保存本次登录。'
+        session.status, session.message = 'expired', '等待网站验证超时，尚未确认目标平台身份，未保存本次登录。'
         return None
 
     async def _open_oauth(self, context, page, session, provider):
@@ -994,7 +1058,8 @@ class LoginFlow:
                                                      name=session.name, interval_hours=session.interval_hours,
                                                      site_cookies=getattr(session, 'site_cookies', []),
                                                      oauth_cookies=getattr(session, 'oauth_cookies', []),
-                                                     oauth_user_agent=getattr(session, 'oauth_user_agent', None))
+                                                     oauth_user_agent=getattr(session, 'oauth_user_agent', None),
+                                                     proxy=getattr(session, 'account_proxy', None))
                 except ValueError as error:
                     session.status, session.message = 'failed', str(error)
                     return
@@ -1010,6 +1075,7 @@ class LoginFlow:
                     'session': session_cookie, 'api_user': str(profile['id']), 'login_via': login_via,
                     'oauth_cookies': getattr(session, 'oauth_cookies', []),
                     'oauth_user_agent': getattr(session, 'oauth_user_agent', None),
+                    'proxy': getattr(session, 'account_proxy', None),
                     'site_cookies': getattr(session, 'site_cookies', []),
                 })
                 known_balance = quota is not None and used is not None
@@ -1018,4 +1084,4 @@ class LoginFlow:
                                  last_message='已通过浏览器授权关联账号')
             session.status, session.message = 'success', f'已保存「{name}」的登录状态。'
             if snapshot is None:
-                session.message += ' 余额暂未取得，未使用登录响应中的占位金额。'
+                session.message += ' 余额暂未取得，保留原余额或显示未知，后续签到时再同步。'

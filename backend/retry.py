@@ -15,6 +15,7 @@ def transient_error(error):
             'net::ERR_CONNECTION_', 'net::ERR_NETWORK_CHANGED', 'net::ERR_INTERNET_DISCONNECTED',
             'net::ERR_NAME_NOT_RESOLVED', 'net::ERR_TIMED_OUT', 'net::ERR_EMPTY_RESPONSE',
             'net::ERR_ABORTED', 'Execution context was destroyed', 'Failed to fetch',
+            'net::ERR_PROXY_CONNECTION_FAILED', 'net::ERR_TUNNEL_CONNECTION_FAILED',
             'Target page, context or browser has been closed',
         ))
     return False

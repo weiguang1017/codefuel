@@ -200,7 +200,7 @@ class _EphemeralBrowserContext:
 			await self._browser.close()
 
 
-async def launch_login_context(settings: BrowserLoginSettings, *, use_proxy: bool = False) -> BrowserContext:
+async def launch_login_context(settings: BrowserLoginSettings, *, use_proxy: bool = False, proxy_override=None) -> BrowserContext:
 	_ensure_binary_path(settings)
 
 	launch_kwargs: dict = {
@@ -210,28 +210,36 @@ async def launch_login_context(settings: BrowserLoginSettings, *, use_proxy: boo
 	}
 	if settings.humanize:
 		launch_kwargs['human_preset'] = 'careful'
+	direct = proxy_override is not None and proxy_override['server'] == 'direct://'
+	if direct:
+		launch_kwargs['args'] = ['--no-proxy-server']
 
-	proxy = get_playwright_proxy(use_proxy=use_proxy)
+	proxy = get_playwright_proxy(use_proxy=use_proxy) if proxy_override is None else None
 	if proxy:
 		launch_kwargs['proxy'] = proxy
-		if is_debug_enabled():
-			print(f'[INFO] Browser proxy enabled: {proxy["server"]}')
-		else:
-			print('[INFO] Browser proxy enabled')
-	elif use_proxy:
+		print('[INFO] Browser proxy enabled')
+	elif use_proxy and proxy_override is None:
 		print('[WARN] Provider requires proxy but CHECKIN_PROXY_URL is not set')
 
 	if settings.persist_profile:
 		from cloakbrowser import launch_persistent_context_async
 
 		settings.profile_dir.mkdir(parents=True, exist_ok=True)
+		if proxy_override is not None and not direct:
+			launch_kwargs['proxy'] = proxy_override
 		return await launch_persistent_context_async(str(settings.profile_dir), **launch_kwargs)
 
 	from cloakbrowser import launch_async
 
 	context_kwargs = {'viewport': launch_kwargs.pop('viewport')}
+	if proxy_override is not None and not direct:
+		context_kwargs['proxy'] = proxy_override
 	browser = await launch_async(**launch_kwargs)
-	context = await browser.new_context(**context_kwargs)
+	try:
+		context = await browser.new_context(**context_kwargs)
+	except BaseException:
+		await browser.close()
+		raise
 	return _EphemeralBrowserContext(context, browser)
 
 
