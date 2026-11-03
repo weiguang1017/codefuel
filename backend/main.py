@@ -32,6 +32,7 @@ async def reauthenticate_checkin(row, api_user):
 engine = CheckinEngine(reauthenticate=reauthenticate_checkin)
 queued = set()
 active = set()
+jobs = set()
 
 
 class AccountIn(BaseModel):
@@ -101,8 +102,17 @@ async def lifespan(app):
         await task
     except asyncio.CancelledError:
         pass
-    await login_flow.close()
-    store.close()
+    pending_jobs = tuple(jobs)
+    for job in pending_jobs:
+        job.cancel()
+    try:
+        await login_flow.close()
+    finally:
+        try:
+            if pending_jobs:
+                await asyncio.gather(*pending_jobs, return_exceptions=True)
+        finally:
+            store.close()
 
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION, lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
@@ -161,7 +171,9 @@ def enqueue(account_id, trigger):
             return False
         queued.add(account_id)
         store.patch(account_id, status='queued', last_message='已加入签到队列')
-        asyncio.create_task(execute(account_id, trigger))
+        task = asyncio.create_task(execute(account_id, trigger))
+        jobs.add(task)
+        task.add_done_callback(jobs.discard)
         return True
 
 

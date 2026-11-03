@@ -2,7 +2,7 @@ import asyncio
 import json
 from datetime import timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 import pytest
 from fastapi.testclient import TestClient
 from backend.store import Store, utcnow, iso
@@ -87,6 +87,25 @@ def account(**kw):
     return {'name': '主账号', 'provider': 'anyrouter', 'auth_mode': 'password',
             'email': 'test@example.com', 'password': 'correct-horse', 'enabled': True,
             'interval_hours': 6, **kw}
+
+
+@pytest.mark.asyncio
+async def test_lifespan_cancels_checkin_jobs_before_closing_store(monkeypatch):
+    blocked = asyncio.Event()
+    job = asyncio.create_task(blocked.wait())
+    jobs = {job}
+    store = SimpleNamespace(recover_interrupted=Mock(), close=Mock())
+    login_flow = SimpleNamespace(close=AsyncMock())
+    monkeypatch.setattr(main, 'jobs', jobs)
+    monkeypatch.setattr(main, 'store', store)
+    monkeypatch.setattr(main, 'login_flow', login_flow)
+
+    async with main.lifespan(main.app):
+        pass
+
+    assert job.cancelled()
+    login_flow.close.assert_awaited_once()
+    store.close.assert_called_once()
 
 
 class FakeContext:

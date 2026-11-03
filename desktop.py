@@ -48,7 +48,8 @@ class LocalServer:
         from backend.main import app
 
         config = uvicorn.Config(app, host='127.0.0.1', port=self.port, log_level='warning',
-                                access_log=False, lifespan='on', loop='asyncio', http='h11', ws='none')
+                                access_log=False, lifespan='on', loop='asyncio', http='h11', ws='none',
+                                timeout_graceful_shutdown=3)
         self.server = uvicorn.Server(config)
         self.thread = threading.Thread(target=self.server.run, name='dailyquota-api', daemon=True)
         self.thread.start()
@@ -79,17 +80,8 @@ def build_window(url):
     )
 
     def on_closing():
-        # Closing the window stops the scheduler; say so instead of failing silently.
-        try:
-            pending = window.evaluate_js('window.__dqEnabledAccounts ? window.__dqEnabledAccounts() : 0') or 0
-        except Exception:
-            pending = 0
-        if not pending:
-            return True
-        return window.create_confirmation_dialog(
-            '退出码粮？',
-            '关闭窗口会同时停止自动签到。电脑休眠或关机期间无法执行，下次打开时会补做一次到期任务。',
-        )
+        # The native close event runs on the UI thread. Never wait for renderer JS here.
+        return True
 
     window.events.closing += on_closing
     return window
