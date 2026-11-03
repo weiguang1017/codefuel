@@ -1,0 +1,215 @@
+# 推送 v* 标签时：构建 macOS 与 Windows 安装包，并创建 GitHub Release。
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 要发布的标签名（需已存在），例如 v0.3.0
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: 测试
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --locked --dev
+      - run: uv run --locked pytest -q
+
+  build-macos:
+    name: 构建 macOS · ${{ matrix.arch }}
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            arch: arm64
+          - os: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      # 手动重发保留标签源码，只从本次工作流提交取 DMG 打包脚本。
+      - name: 获取本次工作流的打包工具
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          path: .release-tools
+          sparse-checkout: build/make_dmg.sh
+          sparse-checkout-cone-mode: false
+      - name: 应用修正的 DMG 打包工具
+        if: github.event_name == 'workflow_dispatch'
+        run: cp .release-tools/build/make_dmg.sh build/make_dmg.sh
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --locked --dev
+
+      - name: 生成图标
+        run: |
+          uv run --locked python build/make_icon.py
+          iconutil -c icns -o build/icon.icns build/icon.iconset
+
+      - name: 编译并自检
+        env:
+          PYINSTALLER_CONFIG_DIR: ${{ github.workspace }}/build/.pyinstaller
+        run: |
+          uv run --locked pyinstaller --noconfirm --distpath dist --workpath build/pyinstaller-codefuel build/CodeFuel.spec
+          ./dist/CodeFuel.app/Contents/MacOS/CodeFuel --selftest --port 18877
+
+      - name: 打包 DMG 并核对架构
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCH="$(lipo -archs dist/CodeFuel.app/Contents/MacOS/CodeFuel | xargs | tr ' ' '-')"
+          test "$ARCH" = "${{ matrix.arch }}" || { echo "应用架构不匹配：$ARCH" >&2; exit 1; }
+          NODE="$(find dist/CodeFuel.app/Contents -path '*/playwright/driver/node' -type f -print -quit)"
+          test -n "$NODE" || { echo "缺少 Playwright Node 驱动" >&2; exit 1; }
+          lipo "$NODE" -verify_arch "${{ matrix.arch }}"
+          # CI 无图形会话，访达自动化不可用；-skip-layout 只跳过图标排版。
+          bash build/make_dmg.sh dist/CodeFuel.app "dist/CodeFuel-macOS-${ARCH}.dmg" --skip-layout
+          hdiutil verify "dist/CodeFuel-macOS-${ARCH}.dmg"
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: macos-installer-${{ matrix.arch }}
+          path: dist/*.dmg
+          if-no-files-found: error
+
+  build-windows:
+    name: 构建 Windows 安装包
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --locked --dev
+
+      - name: 生成图标
+        run: uv run --locked python build/make_icon.py
+
+      - name: 编译并自检
+        shell: pwsh
+        env:
+          PYINSTALLER_CONFIG_DIR: ${{ github.workspace }}\build\.pyinstaller
+        run: |
+          uv run --locked pyinstaller --noconfirm --distpath dist --workpath build/pyinstaller-codefuel build/CodeFuel.spec
+          if (-not (Test-Path 'dist\CodeFuel\CodeFuel.exe')) { throw '未生成 CodeFuel.exe' }
+          $p = Start-Process -FilePath 'dist\CodeFuel\CodeFuel.exe' -ArgumentList '--selftest','--port','18877' -PassThru -NoNewWindow
+          if (-not $p.WaitForExit(120000)) { $p.Kill(); throw '自检超时' }
+          if ($p.ExitCode -ne 0) { throw "自检失败，退出码 $($p.ExitCode)" }
+
+      - name: 安装 Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          Add-Content $env:GITHUB_PATH "C:\Program Files (x86)\Inno Setup 6"
+
+      - name: 制作安装程序
+        shell: pwsh
+        run: |
+          $version = "${{ inputs.tag || github.ref_name }}".TrimStart('v')
+          if (-not $version) { $version = '0.0.0' }
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$version" "build\installer.iss"
+          Get-ChildItem dist\*.exe | Select-Object Name, Length
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: windows-installer
+          path: dist/*-setup.exe
+          if-no-files-found: error
+
+  release:
+    name: 发布 Release
+    needs: [build-macos, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+
+      - name: 整理发布文件
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "下载到的工作目录："
+          find artifacts -maxdepth 2 -type f -printf '%s\t%p\n' | sort -k2
+          mkdir -p release
+          # 按文件类型收拢，不用通配符 cp，避免静默失败。
+          # 只发布安装器；Windows 便携版的内部文件（node.exe 等）不能单独上传。
+          for ARCH in arm64 x86_64; do
+            cp -v "artifacts/macos-installer-${ARCH}/CodeFuel-macOS-${ARCH}.dmg" release/
+          done
+          find artifacts/windows-installer -maxdepth 1 -type f -name '*setup.exe' \
+            -exec cp -v {} release/ \;
+          echo "待上传："
+          ls -lh release
+          # 一个产物都没有就让整个任务失败，绝不发布空 Release。
+          compgen -G "release/*.dmg" > /dev/null || { echo "缺少 macOS dmg" >&2; exit 1; }
+          compgen -G "release/*setup.exe" > /dev/null || { echo "缺少 Windows 安装程序" >&2; exit 1; }
+          # 发布文件数量必须精简，避免把内部可执行文件散出去。
+          COUNT=$(find release -maxdepth 1 -type f | wc -l)
+          [ "$COUNT" -eq 3 ] || { echo "必须恰好发布 3 个安装包，实际 $COUNT 个" >&2; exit 1; }
+
+      - name: 创建 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: 码粮 CodeFuel ${{ inputs.tag || github.ref_name }}
+          draft: false
+          generate_release_notes: true
+          body: |
+            为代码添粮，让灵感续航。
+
+            ## 下载
+
+            | 平台 | 文件 | 说明 |
+            |---|---|---|
+            | macOS（Apple Silicon） | `CodeFuel-macOS-arm64.dmg` | 双击挂载，把应用拖入「应用程序」 |
+            | macOS（Intel） | `CodeFuel-macOS-x86_64.dmg` | 双击挂载，把应用拖入「应用程序」 |
+            | Windows 10/11 | `CodeFuel-*-setup.exe` | 安装向导，可选安装目录 |
+
+            ## 首次打开提示
+
+            安装包**未做代码签名与公证**，系统可能拦截：
+
+            - **macOS**：右键点应用 →「打开」，或到「系统设置 → 隐私与安全性」点「仍要打开」。
+            - **Windows**：SmartScreen 提示时点「更多信息」→「仍要运行」。
+
+            ## 运行要求
+
+            - 需要本机已安装 **Google Chrome**（签到复用系统浏览器，不额外下载 Chromium）。
+            - 账号凭据用 Fernet 加密后保存在本机，不会上传。
+          files: |
+            release/*.dmg
+            release/CodeFuel-*-setup.exe
