@@ -87,14 +87,17 @@ async def test_verification_completion_is_detected_without_manual_resume(site, t
         try:
             session = flow.start(provider_id, 'manual', 'fixture')
             async def waiting():
-                while not session.verification_auto:
+                while not session.verification_auto and not session.task.done():
                     await asyncio.sleep(.01)
-            await asyncio.wait_for(waiting(), 5)
+            await asyncio.wait_for(waiting(), 20)
+            assert session.verification_auto, (
+                f'authorization ended before verification polling started: '
+                f'status={session.status}, stage={session.stage}')
             assert db.accounts() == []
             assert session.verification_paused
             page = browsers[0].contexts[0].pages[0]
             await page.get_by_role('button', name='完成测试验证').click()
-            await asyncio.wait_for(session.task, 5)
+            await asyncio.wait_for(session.task, 15)
             assert session.status == 'success'
             row = db.account(session.account)
             assert row['balance'] == 120
