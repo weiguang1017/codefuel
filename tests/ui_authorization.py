@@ -95,8 +95,28 @@ async def cases(browser, base):
     assert len(api.accounts) == 1 and api.accounts[0]['provider'] == 'agentrouter'
     assert len(api.starts) == 1 and api.resumes == []
     await api.close()
+    for width, height in [(1440, 1080), (390, 844)]:
+        api = API(plans=[{'stage': 'native_login', 'verification_paused': True, 'statuses': ['success'],
+                         'message': '请在新开的 Chrome 窗口点击 LinuxDO 登录，手动完成登录、真人验证和授权；'
+                                    '返回 AgentRouter 后会自动检测并保存，也可点击下方按钮检测。'
+                                    ' 如 Chrome 弹出代理认证框，请输入该代理的用户名和密码。'}])
+        page = await api.attach(browser, base)
+        await page.set_viewport_size({'width': width, 'height': height})
+        await add(page, 'linuxdo', multiple=False)
+        await page.locator('[name="providers"][value="anyrouter"]').uncheck()
+        await page.locator('[name="providers"][value="agentrouter"]').check()
+        await page.locator('#account-submit').click()
+        await expect(page.locator('.platform-progress .native')).to_contain_text('等待 Chrome 登录')
+        button = page.get_by_role('button', name='已完成登录，检测并保存')
+        await expect(button).to_be_in_viewport()
+        await page.screenshot(path=str(output / f'native-login-{width}.png'))
+        await button.click()
+        await expect(page.locator('#modal h2')).to_have_text('授权结果')
+        assert len(api.accounts) == len(api.starts) == len(api.resumes) == 1
+        await api.close()
     return {'checks': ['必填项自动定位、聚焦、红色提示', '代理及邮箱格式校验', '修正后清除错误与隐藏字段跳过',
-                       '无手动确认的自动检测与保存', 'LinuxDO SSO 期间不显示立即检测按钮', '桌面/窄屏布局'], 'javascript_errors': []}
+                       '无手动确认的自动检测与保存', 'LinuxDO SSO 期间不显示立即检测按钮',
+                       '普通 Chrome 授权状态及手动检测保存', '桌面/窄屏布局'], 'javascript_errors': []}
 
 
 async def main():

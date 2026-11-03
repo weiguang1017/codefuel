@@ -141,8 +141,9 @@ class API:
                         session['auto_polls'] = session.get('auto_polls', 0) + 1
                         return await route.fulfill(json={'id': sid, 'status': 'waiting', 'verification_paused': True,
                                                          'verification_auto': plan.get('verification_auto', False),
-                                                         'message': '请完成网站验证，应用将自动检测并保存。' if plan.get('verification_auto') else
-                                                                    '请在当前登录窗口完成人工处理，然后重新校验。'})
+                                                         'stage': plan.get('stage', 'verification_blocked'),
+                                                         'message': plan.get('message', '请完成网站验证，应用将自动检测并保存。' if plan.get('verification_auto') else
+                                                                    '请在当前登录窗口完成人工处理，然后重新校验。')})
                 index = session['poll']
                 session['poll'] += 1
                 statuses = plan.get('statuses', ['waiting'])

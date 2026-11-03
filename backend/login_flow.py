@@ -412,7 +412,11 @@ class LoginFlow:
 
     async def _run(self, session):
         async with self.window_lock:
-            await self._run_window(session)
+            if session.provider == 'agentrouter' and session.method == 'linuxdo':
+                from .native_login import run_native_login
+                await run_native_login(self, session)
+            else:
+                await self._run_window(session)
 
     async def _run_window(self, session):
         provider = PROVIDERS[session.provider]

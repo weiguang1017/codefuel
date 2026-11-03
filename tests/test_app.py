@@ -938,7 +938,7 @@ async def test_missing_oauth_entry_is_unavailable_without_fallback(db, monkeypat
     verify = AsyncMock()
     monkeypatch.setattr(login, 'verify_target_profile', verify)
     session = login.LoginSession(provider, method, '测试')
-    await flow._run(session)
+    await flow._run_window(session)
     assert session.status == 'unavailable'
     assert login.OAUTH_LABELS[method] in session.message
     assert '未提供' in session.message
@@ -2055,7 +2055,7 @@ async def test_window_refreshes_login_placeholder_money_from_self(db, monkeypatc
     monkeypatch.setattr(flow, '_open_oauth', open_oauth)
 
     session = login.LoginSession('agentrouter', 'linuxdo', '证据窗口')
-    await asyncio.wait_for(flow._run(session), 5)
+    await asyncio.wait_for(flow._run_window(session), 5)
 
     assert session.status == 'success'
     assert session.stage == 'identity_confirmed'
@@ -2081,9 +2081,11 @@ def forbid_unmocked_unit_test_browsers(monkeypatch):
     # Unit tests must fail locally instead of opening real login windows or sites.
     import backend.engine as engine
     import backend.login_flow as login
+    import backend.native_login as native
     forbidden = AsyncMock(side_effect=AssertionError('Test must provide an isolated browser'))
     monkeypatch.setattr(engine, 'launch_async', forbidden)
     monkeypatch.setattr(login, 'launch_async', forbidden)
+    monkeypatch.setattr(native.NativeChrome, '__aenter__', forbidden)
     monkeypatch.setattr(login, 'setup_notice_guard', AsyncMock())
     monkeypatch.setattr(login, 'chrome_user_agent', AsyncMock(return_value='Mozilla/5.0 Chrome/142.0.0.0 Safari/537.36'))
     monkeypatch.setattr(login.LoginFlow, '_wait_oauth_config', AsyncMock(return_value='fixture-client'))

@@ -45,8 +45,9 @@ async def test_interactive_linuxdo_keeps_native_client_hints(db, monkeypatch):
             session.status = 'cancelled'
             return False
         monkeypatch.setattr(flow, '_open_oauth', observe)
-        session = flow.start('agentrouter', 'linuxdo', 'fixture')
-        await session.task
+        # Retained controlled-browser path (background/other-provider support).
+        session = LoginSession('agentrouter', 'linuxdo', 'fixture')
+        await flow._run_window(session)
         assert 'user_agent' not in options[0]
         assert snapshots['native'] == snapshots['interactive']
         assert session.oauth_user_agent and 'HeadlessChrome/' not in session.oauth_user_agent

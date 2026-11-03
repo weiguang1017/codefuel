@@ -266,12 +266,12 @@ function launchLogin(options,selected=[options.provider]){
 function renderLoginQueue(queue){
   if(state.loginQueue!==queue||queue.stopped)return;
   const item=queue.items[queue.index];
-  const statuses={pending:'等待',starting:'正在发起',waiting:'等待授权',detecting:'等待验证 · 自动检测',blocked:'等待人工处理',success:'已保存',error:'未完成',network:'连接中断',unknown:'结果待确认',skipped:'已跳过'};
+  const statuses={pending:'等待',starting:'正在发起',waiting:'等待授权',native:'等待 Chrome 登录',detecting:'等待验证 · 自动检测',blocked:'等待人工处理',success:'已保存',error:'未完成',network:'连接中断',unknown:'结果待确认',skipped:'已跳过'};
   const finished=queue.items.filter(i=>i.status==='success').length;
   modal(`<div class="modal-head"><div><h2>${queue.done?'授权结果':`${methodName(queue.options.method)} · 逐平台授权`}</h2><p>${queue.done?`${finished} / ${queue.items.length} 个平台已独立保存`:`当前 ${queue.index+1} / ${queue.items.length} · ${providerName(item.provider)}`}；已完成的账号会保留。</p></div><button class="icon-button" data-action="close" aria-label="关闭">${icon('x')}</button></div>
     <ol class="platform-progress" aria-live="polite">${queue.items.map((entry,index)=>`<li class="${esc(entry.status)} ${index===queue.index&&!queue.done?'current':''}"><div><b>${providerName(entry.provider)}</b><span>${statuses[entry.status]||esc(entry.status)}</span></div><p>${esc(entry.message)}</p></li>`).join('')}</ol>
     ${!queue.done?`<div class="notice">${icon('info')}每个平台分别在浏览器中授权。入口不可用时可跳过；取消或关闭会停止整个队列，不撤销已保存账号。</div>`:''}
-    <div class="modal-actions">${queue.done?'<button class="button primary" data-action="close">完成</button>':`<button class="button secondary" data-action="cancel-login">取消全部</button>${item.status==='error'?'<button class="button secondary" data-action="skip-login">跳过此平台</button><button class="button primary" data-action="retry-login">重试此平台</button>':''}${item.status==='blocked'?'<button class="button primary" data-action="resume-login">我已处理，重新校验</button>':''}${item.status==='detecting'&&item.canResume?'<button class="button secondary" data-action="resume-login">立即检测</button>':''}${item.status==='network'?'<button class="button primary" data-action="retry-poll">重试查询当前授权</button>':''}${item.status==='unknown'?'<span class="field-help">为避免重复账号，不自动重新发起授权。</span>':''}`}</div>`);
+    <div class="modal-actions">${queue.done?'<button class="button primary" data-action="close">完成</button>':`<button class="button secondary" data-action="cancel-login">取消全部</button>${item.status==='error'?'<button class="button secondary" data-action="skip-login">跳过此平台</button><button class="button primary" data-action="retry-login">重试此平台</button>':''}${item.status==='native'&&item.canResume?'<button class="button primary" data-action="resume-login">已完成登录，检测并保存</button>':''}${item.status==='blocked'?'<button class="button primary" data-action="resume-login">我已处理，重新校验</button>':''}${item.status==='detecting'&&item.canResume?'<button class="button secondary" data-action="resume-login">立即检测</button>':''}${item.status==='network'?'<button class="button primary" data-action="retry-poll">重试查询当前授权</button>':''}${item.status==='unknown'?'<span class="field-help">为避免重复账号，不自动重新发起授权。</span>':''}`}</div>`);
 }
 async function startQueueItem(queue){
   if(!queueActive(queue)||queue.starting)return;
@@ -316,7 +316,7 @@ async function pollLogin(queue){
       renderLoginQueue(queue);return;
     }
     item.canResume=!!result.verification_paused;
-    item.status=result.verification_auto?'detecting':result.verification_paused?'blocked':'waiting';renderLoginQueue(queue);
+    item.status=result.stage==='native_login'?'native':result.verification_auto?'detecting':result.verification_paused?'blocked':'waiting';renderLoginQueue(queue);
     loginPoll=setTimeout(()=>pollLogin(queue),1000);
   }catch(error){
     if(!queueActive(queue))return;
