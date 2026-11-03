@@ -36,3 +36,33 @@ async def test_notice_guard_closes_announcements_and_preserves_authentication():
             assert await page.locator('[role="dialog"]').count() == 4
         finally:
             await browser.close()
+
+
+@pytest.mark.asyncio
+async def test_linuxdo_notice_that_becomes_visible_is_closed_but_consent_remains():
+    if not LOCAL_CHROME:
+        pytest.skip('Local Chrome is required')
+    html = '''<meta charset="utf-8">
+        <div class="d-modal__container" id="welcome" style="display:none"><h2>欢迎使用</h2>
+          <button onclick="this.parentElement.remove()">知道了</button></div>
+        <dialog open id="consent"><h2>应用授权</h2><button>允许</button></dialog>
+        <dialog open id="challenge"><h2>人机验证</h2><button>验证</button></dialog>'''
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(executable_path=LOCAL_CHROME, headless=True)
+        try:
+            context = await browser.new_context()
+            await context.route('**/*', lambda route: route.fulfill(content_type='text/html', body=html))
+            await setup_notice_guard(context, 'https://agentrouter.org',
+                                     additional_origins=('https://linux.do', 'https://connect.linux.do'))
+            page = await context.new_page()
+            for host in ('linux.do', 'connect.linux.do'):
+                await page.goto(f'https://{host}/')
+                await page.evaluate('document.querySelector("#welcome").style.display="block"')
+                await page.wait_for_function('!document.querySelector("#welcome")')
+                assert await page.locator('#consent').count() == 1
+                assert await page.locator('#challenge').count() == 1
+            await page.goto('https://unrelated.example/')
+            await page.evaluate('document.querySelector("#welcome").style.display="block"')
+            assert await page.locator('#welcome').is_visible()
+        finally:
+            await browser.close()

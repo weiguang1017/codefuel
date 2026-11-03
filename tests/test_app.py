@@ -2041,7 +2041,8 @@ async def test_window_refreshes_login_placeholder_money_from_self(db, monkeypatc
     assert session.stage == 'identity_confirmed'
     verify.assert_awaited_once_with(page, provider, 7)
     account = db.account(session.account)
-    assert db.credentials(account) == {'session': 'evidence-cookie', 'api_user': '7'}
+    assert db.credentials(account) == {'session': 'evidence-cookie', 'api_user': '7',
+                                       'oauth_user_agent': 'Mozilla/5.0 Chrome/142.0.0.0 Safari/537.36'}
     assert account['name'] == '证据窗口'
     assert account['login_via'] == 'linuxdo'
     assert account['balance'] == 90
@@ -2064,8 +2065,8 @@ def forbid_unmocked_unit_test_browsers(monkeypatch):
     monkeypatch.setattr(engine, 'launch_async', forbidden)
     monkeypatch.setattr(login, 'launch_async', forbidden)
     monkeypatch.setattr(login, 'setup_notice_guard', AsyncMock())
+    monkeypatch.setattr(login, 'chrome_user_agent', AsyncMock(return_value='Mozilla/5.0 Chrome/142.0.0.0 Safari/537.36'))
     monkeypatch.setattr(login.LoginFlow, '_wait_oauth_config', AsyncMock(return_value='fixture-client'))
-    monkeypatch.setattr(login.LoginFlow, '_minimize_page', AsyncMock())
     monkeypatch.setattr(login, 'UPSTREAM_VERIFICATION_GRACE', 0)
 
 
@@ -2230,7 +2231,8 @@ async def test_background_oauth_reuses_only_its_cache_and_refreshes_placeholder_
     assert r['profile']['checked_in'] is True
     assert r['session'] == 'new-site'
     assert r['oauth_cookies'] == [upstream]
-    assert launch.call_args.kwargs['headless'] is (method != 'linuxdo')
+    assert launch.call_args.kwargs['headless'] is True
+    assert 'args' not in launch.call_args.kwargs
     context.add_cookies.assert_awaited_once_with([upstream])
     assert all('/logout' not in call.args[0] for call in page.goto.await_args_list)
     verify.assert_awaited_once_with(page, provider, 7)
@@ -2501,11 +2503,12 @@ async def test_repeated_confirmed_login_reports_zero_when_fresh_totals_are_uncha
 
 
 @pytest.mark.asyncio
-async def test_linuxdo_repeated_checkin_reuses_normal_browser_and_keeps_upstream_state(db, monkeypatch):
+@pytest.mark.parametrize('method,domain', [('github', '.github.com'), ('linuxdo', '.linux.do')])
+async def test_repeated_checkin_reuses_headless_browser_and_keeps_upstream_state(db, monkeypatch, method, domain):
     import backend.login_flow as login
-    upstream = {'name': '_t', 'value': 'cached', 'domain': '.linux.do', 'path': '/'}
+    upstream = {'name': '_t', 'value': 'cached', 'domain': domain, 'path': '/'}
     i = db.add_account(account(provider='agentrouter', auth_mode='session', session='old', api_user='7',
-                               login_via='linuxdo', oauth_cookies=[upstream]))
+                               login_via=method, oauth_cookies=[upstream]))
     provider = login.PROVIDERS['agentrouter']
     page = SimpleNamespace(url=provider.domain + '/login', goto=AsyncMock(), evaluate=AsyncMock(), is_closed=lambda: False)
     context = FakeContext([page], cookies=AsyncMock(return_value=[upstream, {
@@ -2519,7 +2522,7 @@ async def test_linuxdo_repeated_checkin_reuses_normal_browser_and_keeps_upstream
     monkeypatch.setattr(login, 'verify_target_profile', AsyncMock(return_value={
         'id': 7, 'quota': 60000000, 'used_quota': 0}))
     flow = login.LoginFlow(db)
-    path = provider.domain + '/api/oauth/linuxdo?code=fixture&state=fixture&mode=login'
+    path = provider.domain + f'/api/oauth/{method}?code=fixture&state=fixture&mode=login'
     async def oauth(*args):
         for callback in list(context.listeners['response']):
             callback(FakeResponse(path, FakeRequest(path, page, frame_url=path),
@@ -2533,8 +2536,8 @@ async def test_linuxdo_repeated_checkin_reuses_normal_browser_and_keeps_upstream
         assert result['profile']['quota'] == 60000000
         assert context.listeners['response'] == []
     launch.assert_awaited_once()
-    assert launch.call_args.kwargs['headless'] is False
-    assert '--start-minimized' in launch.call_args.kwargs['args']
+    assert launch.call_args.kwargs['headless'] is True
+    assert 'args' not in launch.call_args.kwargs
     context.add_cookies.assert_awaited_once_with([upstream])
     context.clear_cookies.assert_awaited_once()
     clear = context.clear_cookies.call_args.kwargs
@@ -2545,3 +2548,212 @@ async def test_linuxdo_repeated_checkin_reuses_normal_browser_and_keeps_upstream
     await flow.discard_browser_sessions(i)
     assert flow.browser_sessions == {}
     browser.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', [TimeoutError(),
+    {'status': 503, 'body': {'success': False}}])
+async def test_agentrouter_retries_preflight_then_logs_in_only_once(db, monkeypatch, engine_responses, failure):
+    import backend.engine as engine
+    sleeper = AsyncMock()
+    monkeypatch.setattr(engine, 'asyncio', SimpleNamespace(sleep=sleeper))
+    i = db.add_account(account(provider='agentrouter', auth_mode='session', session='saved', api_user='7',
+                               oauth_cookies=[{'name': 'upstream', 'value': 'cached'}]))
+    calls = engine_responses([failure, failure, profile_response()])
+    login = AsyncMock(return_value={'session': 'new', 'profile': {
+        'id': 7, 'quota': 62500000, 'used_quota': 0, 'checked_in': True}})
+    result = await engine.CheckinEngine(login).run(db.account(i), db.credentials(db.account(i)))
+    assert result['status'] == 'success' and result['reward'] == 25
+    assert len(calls) == 3 and all(call[1] == 'GET' for call in calls)
+    assert [call.args[0] for call in sleeper.await_args_list] == [2.0, 5.0]
+    assert '自动重试 2 次' in result['message']
+    assert '_retryable' not in result
+    login.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_agentrouter_preflight_retry_exhaustion_preserves_stored_balance(db, monkeypatch, engine_responses):
+    import backend.engine as engine
+    monkeypatch.setattr(engine, 'RETRY_DELAYS', (0, 0))
+    i = db.add_account(account(provider='agentrouter', auth_mode='session', session='saved', api_user='7'))
+    db.patch(i, balance=100, total_quota=100, has_snapshot=1)
+    calls = engine_responses([TimeoutError()] * 3)
+    login = AsyncMock()
+    row = db.account(i)
+    result = await engine.CheckinEngine(login).run(row, db.credentials(row))
+    db.finish_run(db.begin_run(row, 'manual'), i, result, 'manual')
+    assert len(calls) == 3 and result['status'] == 'failed'
+    assert result['reward'] is None and 'after_balance' not in result
+    assert db.account(i)['balance'] == 100
+    assert db.credentials(db.account(i))['session'] == 'saved'
+    assert len(db.runs()) == 1
+    login.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status', [401, 403, 429])
+async def test_agentrouter_permanent_preflight_failure_is_not_retried(db, engine_responses, status):
+    from backend.engine import CheckinEngine
+    i = db.add_account(account(provider='agentrouter', auth_mode='session', session='saved', api_user='7'))
+    calls = engine_responses([{'status': status, 'body': {'success': False}}])
+    result = await CheckinEngine().run(db.account(i), db.credentials(db.account(i)))
+    assert result['status'] in ('failed', 'manual_required')
+    assert len(calls) == 1 and '自动重试' not in result['message']
+
+
+@pytest.fixture
+def background_retry_flow(db, monkeypatch):
+    import backend.login_flow as login
+    upstream = {'name': '_t', 'value': 'cached', 'domain': '.linux.do', 'path': '/'}
+    i = db.add_account(account(provider='agentrouter', auth_mode='session', session='old', api_user='7',
+                               login_via='linuxdo', oauth_cookies=[upstream]))
+    browsers, contexts = [], []
+    async def launch(**kwargs):
+        assert kwargs['headless'] is True and 'args' not in kwargs
+        page = SimpleNamespace(url='https://agentrouter.org/login', goto=AsyncMock(return_value=None))
+        context = FakeContext([page])
+        context.add_cookies = AsyncMock()
+        browser = SimpleNamespace(new_context=AsyncMock(return_value=context), close=AsyncMock())
+        browsers.append(browser)
+        contexts.append(context)
+        return browser
+    monkeypatch.setattr(login, 'launch_async', AsyncMock(side_effect=launch))
+    monkeypatch.setattr(login, 'RETRY_DELAYS', (0, 0))
+    flow = login.LoginFlow(db)
+    return SimpleNamespace(flow=flow, row=db.account(i), browsers=browsers, contexts=contexts)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', ['network', 'config', 'upstream_503'])
+async def test_background_oauth_retries_temporary_failure_without_visible_fallback(background_retry_flow, monkeypatch, failure):
+    from playwright.async_api import Error
+    f = background_retry_flow
+    attempts = 0
+    async def oauth(context, page, session, provider):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            if failure == 'network':
+                raise Error('net::ERR_CONNECTION_RESET at https://example.test/?state=private')
+            if failure == 'config':
+                session.status, session.stage = 'failed', 'provider_config_unavailable'
+                session.retryable = True
+                return False
+            page.url = 'https://connect.linux.do/oauth2/authorize'
+            return not await f.flow._background_auth_blocked(session, context, {'connect.linux.do': 503})
+        session.status = 'success'
+        session.checkin_result = {'session': 'fresh', 'profile': {'id': 7, 'checked_in': True}}
+        return True
+    monkeypatch.setattr(f.flow, '_open_oauth', oauth)
+    result = await f.flow.authenticate_for_checkin(f.row, '7')
+    assert result['attempts'] == 3 and result['profile']['checked_in'] is True
+    assert 'private' not in json.dumps(result)
+    assert len(f.browsers) == 3
+    for browser in f.browsers[:2]:
+        browser.close.assert_awaited_once()
+    f.browsers[-1].close.assert_not_awaited()
+    assert f.flow.sessions == {}
+    assert all(not listeners for context in f.contexts for listeners in context.listeners.values())
+    await f.flow.close()
+    f.browsers[-1].close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('submitted', [False, True])
+async def test_background_oauth_exhaustion_and_unknown_submission(background_retry_flow, monkeypatch, submitted):
+    from playwright.async_api import TimeoutError as BrowserTimeout
+    f = background_retry_flow
+    async def oauth(context, page, session, provider):
+        if submitted:
+            for handler in context.listeners['request']:
+                handler(SimpleNamespace(url=provider.domain + '/api/oauth/linuxdo?code=private&state=private'))
+        raise BrowserTimeout('private timeout details')
+    monkeypatch.setattr(f.flow, '_open_oauth', oauth)
+    result = await f.flow.authenticate_for_checkin(f.row, '7')
+    assert result['attempts'] == (1 if submitted else 3)
+    assert result['retryable'] is (not submitted)
+    if submitted:
+        assert result['error_kind'] == 'outcome_unknown'
+    assert 'private' not in json.dumps(result)
+    assert f.flow.sessions == {} and f.flow.browser_sessions == {}
+    for browser in f.browsers:
+        browser.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_background_retry_cancellation_cleans_up_and_does_not_restart(background_retry_flow, monkeypatch):
+    import backend.login_flow as login
+    from playwright.async_api import TimeoutError as BrowserTimeout
+    f = background_retry_flow
+    monkeypatch.setattr(login, 'RETRY_DELAYS', (30, 30))
+    monkeypatch.setattr(f.flow, '_open_oauth', AsyncMock(side_effect=BrowserTimeout('fixture timeout')))
+    task = asyncio.create_task(f.flow.authenticate_for_checkin(f.row, '7'))
+    try:
+        for _ in range(100):
+            if f.browsers and f.browsers[0].close.await_count:
+                break
+            await asyncio.sleep(.01)
+        assert len(f.browsers) == 1
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert f.flow.sessions == {} and f.flow.browser_sessions == {}
+        f.browsers[0].close.assert_awaited_once()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_closing_app_cancels_authorization_retry_wait(background_retry_flow, monkeypatch):
+    import backend.login_flow as login
+    from playwright.async_api import TimeoutError as BrowserTimeout
+    f = background_retry_flow
+    monkeypatch.setattr(login, 'RETRY_DELAYS', (30, 30))
+    monkeypatch.setattr(f.flow, '_open_oauth', AsyncMock(side_effect=BrowserTimeout('fixture timeout')))
+    task = asyncio.create_task(f.flow.authenticate_for_checkin(f.row, '7'))
+    try:
+        for _ in range(100):
+            if f.browsers and f.browsers[0].close.await_count:
+                break
+            await asyncio.sleep(.01)
+        await f.flow.close()
+        assert task.cancelled()
+        assert len(f.browsers) == 1
+        assert f.flow.sessions == {} and f.flow.background_tasks == set()
+        f.browsers[0].close.assert_awaited_once()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_linuxdo_browser_identity_is_encrypted_and_preserved_on_reauthorization(db):
+    from backend.login_flow import LoginFlow, LoginSession
+    ua = 'Mozilla/5.0 Chrome/142.0.0.0 Safari/537.36'
+    flow = LoginFlow(db)
+    session = LoginSession('agentrouter', 'linuxdo', 'fixture')
+    session.oauth_user_agent = ua
+    await flow._persist(session, {'id': 7}, 'fixture')
+    row = db.account(session.account)
+    assert db.credentials(row)['oauth_user_agent'] == ua
+    assert ua not in row['encrypted'] and ua not in json.dumps(db.dashboard())
+    refresh = LoginSession('agentrouter', 'linuxdo', 'fixture', session.account)
+    refresh.oauth_user_agent = ua.replace('142', '143')
+    await flow._persist(refresh, {'id': 7}, 'refreshed')
+    assert db.credentials(db.account(session.account))['oauth_user_agent'] == refresh.oauth_user_agent
+
+
+@pytest.mark.asyncio
+async def test_engine_saves_browser_identity_only_with_verified_account(db, engine_responses):
+    from backend.engine import CheckinEngine
+    i = db.add_account(account(provider='agentrouter', auth_mode='session', session='saved', api_user='7',
+                               oauth_cookies=[{'name': 'upstream', 'value': 'cached'}]))
+    engine_responses([profile_response(), profile_response()])
+    ua = 'Mozilla/5.0 Chrome/142.0.0.0 Safari/537.36'
+    fresh = {'session': 'fresh', 'profile': {'id': 7, 'checked_in': True}, 'oauth_user_agent': ua}
+    result = await CheckinEngine(AsyncMock(return_value=fresh)).run(db.account(i), db.credentials(db.account(i)))
+    assert result['_session_update']['oauth_user_agent'] == ua
+    fresh['profile']['id'] = 8
+    result = await CheckinEngine(AsyncMock(return_value=fresh)).run(db.account(i), db.credentials(db.account(i)))
+    assert '_session_update' not in result and result['status'] == 'manual_required'

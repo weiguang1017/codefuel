@@ -12,7 +12,9 @@ from cloakbrowser import launch_async
 from .providers import PROVIDERS, BROWSER_METHODS, supports
 from .quota import quota_snapshot
 from .cookies import site_cookies
+from .browser_identity import chrome_user_agent
 from .popups import setup_notice_guard
+from .retry import RETRY_DELAYS, transient_error, transient_status
 from .upstream_imports import prepare_browser_page, wait_for_waf_ready, get_playwright_proxy
 
 WINDOW_TIMEOUT = 900
@@ -239,6 +241,7 @@ class LoginFlow:
         self.active_id = None
         self.window_lock = asyncio.Lock()
         self.browser_sessions = {}
+        self.background_tasks = set()
 
     def is_authorizing(self, account_id):
         return any(s.account_id == account_id and s.status in ACTIVE_STATUSES
@@ -304,11 +307,15 @@ class LoginFlow:
             return True
 
     async def close(self):
-        tasks = []
+        tasks = set(self.background_tasks)
         for session in self.sessions.values():
             if session.task and not session.task.done():
-                self.cancel(session.id)
-                tasks.append(session.task)
+                if session.status in ACTIVE_STATUSES:
+                    session.cancelled = True
+                    session.status, session.message = 'cancelled', '已取消授权。'
+                tasks.add(session.task)
+        for task in tasks:
+            task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         await self.discard_browser_sessions()
@@ -325,6 +332,26 @@ class LoginFlow:
         self.sessions = {s.id: s for s in keep + pending}
 
     async def authenticate_for_checkin(self, row, api_user):
+        task = asyncio.current_task()
+        self.background_tasks.add(task)
+        try:
+            return await self._authenticate_with_retries(row, api_user)
+        finally:
+            self.background_tasks.discard(task)
+
+    async def _authenticate_with_retries(self, row, api_user):
+        for attempt in range(len(RETRY_DELAYS) + 1):
+            result = await self._authenticate_for_checkin_once(row, api_user)
+            if not result:
+                return result
+            result['attempts'] = attempt + 1
+            if result.get('profile') or not result.get('retryable') or attempt == len(RETRY_DELAYS):
+                if attempt and not result.get('profile'):
+                    result['message'] += f' 授权阶段已自动重试 {attempt} 次。'
+                return result
+            await asyncio.sleep(RETRY_DELAYS[attempt])
+
+    async def _authenticate_for_checkin_once(self, row, api_user):
         """Try a fresh login with cached upstream cookies, without invalidating the site session."""
         credentials = self.store.credentials(row)
         cached = self._oauth_cookies(credentials.get('oauth_cookies', []), row['login_via'])
@@ -335,19 +362,35 @@ class LoginFlow:
         session.checkin_background = True
         session.checkin_require_login_response = True
         session.oauth_cookies = cached
+        session.oauth_user_agent = credentials.get('oauth_user_agent')
         session.site_cookies = site_cookies(credentials.get('site_cookies', []), PROVIDERS[row['provider']])
         session.checkin_result = None
+        session.checkin_submission_started = False
+        session.retryable = False
         self.sessions[session.id] = session
         session.task = asyncio.current_task()
         try:
             async with self.window_lock:
                 self.active_id = session.id
                 session.created = time.time()
-                await asyncio.wait_for(self._run_window(session), timeout=90)
-            return session.checkin_result or {
+                try:
+                    await asyncio.wait_for(self._run_window(session), timeout=90)
+                except TimeoutError:
+                    session.stage = 'background_timeout'
+                    session.retryable = True
+                    session.message = '后台授权页面加载超时，已保留登录缓存，请稍后重试。'
+            if session.checkin_result:
+                return session.checkin_result
+            # A callback may already have awarded credit. Never replay it or
+            # begin another login when its outcome could not be confirmed.
+            if session.checkin_submission_started and session.retryable:
+                session.retryable = False
+                session.stage = 'outcome_unknown'
+                session.message = '登录请求已发送，但签到结果尚未确认；已停止自动重试，请稍后查询余额或到官网确认。'
+            return {
                 'error_kind': session.stage,
-                'message': session.message if session.stage in ('upstream_blocked', 'login_required', 'provider_config_unavailable') else
-                           '后台授权未完成，已保留缓存；尚不能判断登录会话是否过期。请检查站点状态或网络。',
+                'retryable': session.retryable,
+                'message': session.message,
             }
         except asyncio.CancelledError:
             if session.cancelled:
@@ -367,16 +410,15 @@ class LoginFlow:
         context = None
         evidence = None
         document_observer = None
+        request_observer = None
         cache_key = None
         try:
             if session.cancelled or session.status not in ACTIVE_STATUSES:
                 return
             background = getattr(session, 'checkin_background', False)
-            # LinuxDO was authorized in normal Chrome. Keep that browser mode and
-            # reuse its account-isolated context instead of reopening empty windows.
-            normal_background = background and session.provider == 'agentrouter' and session.method == 'linuxdo'
-            session.normal_background = normal_background
-            if normal_background:
+            # Both OAuth providers use a truly headless, account-isolated browser.
+            # Minimizing a headed window still briefly exposes it at startup.
+            if background and session.provider == 'agentrouter':
                 cache_key = (session.account_id, session.provider, session.method, session.checkin_identity)
             if not background and session.account_id is not None:
                 await self.discard_browser_sessions(session.account_id)
@@ -385,9 +427,7 @@ class LoginFlow:
                     credentials = self.store.credentials(row)
                     session.oauth_cookies = self._oauth_cookies(credentials.get('oauth_cookies', []), session.method)
                     session.site_cookies = site_cookies(credentials.get('site_cookies', []), provider)
-            launch_options = {'headless': background and not normal_background}
-            if normal_background:
-                launch_options['args'] = ['--start-minimized']
+            launch_options = {'headless': background}
             proxy = get_playwright_proxy(use_proxy=provider.use_proxy)
             if proxy:
                 launch_options['proxy'] = proxy
@@ -399,14 +439,25 @@ class LoginFlow:
                     browser = None
             if browser is None:
                 browser = await asyncio.wait_for(launch_async(**launch_options), timeout=90)
-                context = await browser.new_context(viewport=None)
-                await setup_notice_guard(context, provider.domain)
+                context_options = {'viewport': None}
+                if session.provider == 'agentrouter' and session.method == 'linuxdo':
+                    session.oauth_user_agent = await chrome_user_agent(browser, getattr(session, 'oauth_user_agent', None))
+                    context_options['user_agent'] = session.oauth_user_agent
+                context = await browser.new_context(**context_options)
+                if session.method == 'linuxdo':
+                    await setup_notice_guard(context, provider.domain,
+                        additional_origins=('https://linux.do', 'https://connect.linux.do'))
+                else:
+                    await setup_notice_guard(context, provider.domain)
                 if getattr(session, 'oauth_cookies', None):
                     await context.add_cookies(self._oauth_cookies(session.oauth_cookies, session.method))
                 if getattr(session, 'site_cookies', None):
                     await context.add_cookies(session.site_cookies)
                 page = await context.new_page()
             else:
+                if session.provider == 'agentrouter' and session.method == 'linuxdo':
+                    # The encrypted identity normally comes back on the next run.
+                    session.oauth_user_agent = await chrome_user_agent(browser, getattr(session, 'oauth_user_agent', None))
                 # Only this app-owned target-site state is reset. The upstream
                 # login and its verification cookies remain in the same context.
                 host = urlparse(provider.domain).hostname
@@ -416,10 +467,6 @@ class LoginFlow:
                 for extra in list(context.pages):
                     if extra is not page:
                         await extra.close()
-            minimized = set()
-            if normal_background:
-                await self._minimize_page(context, page)
-                minimized.add(id(page))
             evidence = LoginEvidence(
                 context, provider, session.method, self._session_cookie,
                 require_login_response=getattr(session, 'checkin_require_login_response', False))
@@ -433,7 +480,7 @@ class LoginFlow:
                 if (getattr(response.request, 'resource_type', None) != 'document'
                         or host not in ('github.com', 'linux.do', 'connect.linux.do')):
                     return
-                if response.status in (403, 429):
+                if response.status in (403, 429) or transient_status(response.status):
                     blocked_documents[host] = response.status
                     session.blocked_since.setdefault(host, time.monotonic())
                 elif response.status == 200:
@@ -441,10 +488,22 @@ class LoginFlow:
                     session.blocked_since.pop(host, None)
 
             if background:
+                def observe_request(request):
+                    if (_origin(request.url) == _origin(provider.domain)
+                            and urlparse(request.url).path in ('/api/user/login', f'/api/oauth/{session.method}')):
+                        session.checkin_submission_started = True
+
+                context.on('request', observe_request)
+                request_observer = observe_request
                 context.on('response', observe_document)
                 document_observer = observe_document
             # Explicit authorization does not auto-dismiss consent or verification.
-            await page.goto(provider.domain + provider.login_path, wait_until='domcontentloaded', timeout=60000)
+            response = await page.goto(provider.domain + provider.login_path, wait_until='domcontentloaded', timeout=60000)
+            if background and response and (response.status in (403, 429) or transient_status(response.status)):
+                session.status, session.stage = 'failed', 'provider_unavailable'
+                session.retryable = transient_status(response.status)
+                session.message = f'目标平台登录页返回 HTTP {response.status}，已保留登录缓存，请稍后重试或处理站点验证。'
+                return
             if session.cancelled:
                 return
             session.status = 'waiting'
@@ -459,6 +518,7 @@ class LoginFlow:
                     return
                 if not clicked:
                     session.status = 'unavailable'
+                    session.retryable = background
                     session.message = f'当前页面未提供可识别的 {label} 授权入口，未保存账号；这不代表平台一定不支持。可重试或选择浏览器手动登录。'
                     return
                 session.message = (f'请在本次打开的浏览器中登录 {label} 并确认授权，返回目标平台后自动校验；'
@@ -472,13 +532,10 @@ class LoginFlow:
                 if not context.pages:
                     session.status, session.message = 'cancelled', '登录窗口已关闭，未保存账号。'
                     return
-                if normal_background:
-                    for current_page in context.pages:
-                        if id(current_page) not in minimized:
-                            await self._minimize_page(context, current_page)
-                            minimized.add(id(current_page))
                 captured = await evidence.get()
                 if captured:
+                    if background:
+                        session.checkin_submission_started = True
                     profile, cookie = captured
                     await self._complete_login(session, profile, cookie, context, evidence)
                     return
@@ -553,19 +610,24 @@ class LoginFlow:
                                        if target_pages else '仍在身份提供方登录或验证页面；请手动完成并确认授权，返回目标平台。')
                 await asyncio.sleep(1.5)
             session.status, session.message = 'expired', f'等待授权超时（阶段：{session.stage}）；未确认目标平台身份，未保存账号。'
+            session.retryable = background
         except asyncio.CancelledError:
             if session.status in ACTIVE_STATUSES:
                 session.status, session.message = 'cancelled', '已取消授权。'
             raise
-        except Exception:
+        except Exception as exc:
             if session.status in ACTIVE_STATUSES:
                 session.status = 'failed'
-                session.message = '登录窗口未能完成，请重试，或改用账号密码 / Session 方式。'
+                session.retryable = getattr(session, 'checkin_background', False) and transient_error(exc)
+                session.message = ('后台连接中断或页面加载超时，已保留登录缓存，请稍后重试。' if session.retryable else
+                                   '登录未能完成，请重试，或主动重新授权。')
         finally:
             if evidence:
                 await evidence.close()
             if context and document_observer:
                 context.remove_listener('response', document_observer)
+            if context and request_observer:
+                context.remove_listener('request', request_observer)
             if browser:
                 if cache_key and session.status == 'success':
                     self.browser_sessions[cache_key] = (browser, context, page)
@@ -574,23 +636,6 @@ class LoginFlow:
                         await browser.close()
                     except Exception:
                         pass
-
-    async def _minimize_page(self, context, page):
-        """Keep the owned normal-browser window available without raising it over the app."""
-        cdp = None
-        try:
-            cdp = await context.new_cdp_session(page)
-            window = await cdp.send('Browser.getWindowForTarget')
-            await cdp.send('Browser.setWindowBounds', {'windowId': window['windowId'],
-                                                      'bounds': {'windowState': 'minimized'}})
-        except PlaywrightError:
-            pass
-        finally:
-            if cdp:
-                try:
-                    await cdp.detach()
-                except PlaywrightError:
-                    pass
 
     async def _approve_linuxdo(self, context, session, provider):
         """Approve only the current AgentRouter request that the user authorized us to handle."""
@@ -612,19 +657,31 @@ class LoginFlow:
             ''', provider.domain)
             if not app_matches:
                 continue
-            allow = page.get_by_role('link', name=re.compile(r'^(允许|Allow)$', re.I))
-            for index in range(await allow.count()):
-                candidate = allow.nth(index)
-                href = await candidate.get_attribute('href')
-                target = urlparse(urljoin(page.url, href or ''))
-                if (not href or _origin(target.geturl()) != _origin('https://connect.linux.do')
-                        or not (target.path == '/oauth2/approve' or target.path.startswith('/oauth2/approve/'))
-                        or not await candidate.is_visible()):
-                    continue
-                session.approval_clicked = True
-                session.stage = 'approving_oauth'
-                await candidate.click(timeout=6000)
-                return True
+            for role in ('link', 'button'):
+                allow = page.get_by_role(role, name=re.compile(r'^(允许|Allow)$', re.I))
+                for index in range(await allow.count()):
+                    candidate = allow.nth(index)
+                    if role == 'link':
+                        href = await candidate.get_attribute('href')
+                    else:
+                        # Accept only a real submit control for the official
+                        # approval route, never a generic permission button.
+                        href = await candidate.evaluate('''el => {
+                            const form = el.form;
+                            if (!form || el.type !== 'submit') return null;
+                            const method = (el.getAttribute('formmethod') || form.method).toLowerCase();
+                            if (!['get', 'post'].includes(method)) return null;
+                            return el.getAttribute('formaction') || form.getAttribute('action');
+                        }''')
+                    target = urlparse(urljoin(page.url, href or ''))
+                    if (not href or _origin(target.geturl()) != _origin('https://connect.linux.do')
+                            or not (target.path == '/oauth2/approve' or target.path.startswith('/oauth2/approve/'))
+                            or not await candidate.is_visible() or not await candidate.is_enabled()):
+                        continue
+                    session.approval_clicked = True
+                    session.stage = 'approving_oauth'
+                    await candidate.click(timeout=6000)
+                    return True
         return False
 
     @staticmethod
@@ -648,12 +705,17 @@ class LoginFlow:
             location = urlparse(page.url)
             if location.hostname in blocked_documents:
                 status = blocked_documents[location.hostname]
-                # An ordinary browser may complete the site's own interstitial.
+                # The browser may complete the site's own interstitial.
                 # Wait for that navigation; never click or solve a challenge.
                 since = getattr(session, 'blocked_since', {}).get(location.hostname)
-                if (status == 403 and getattr(session, 'normal_background', False) and since is not None
+                if (status == 403 and since is not None
                         and time.monotonic() - since < UPSTREAM_VERIFICATION_GRACE):
                     continue
+                if transient_status(status):
+                    session.status, session.stage = 'failed', 'upstream_unavailable'
+                    session.retryable = True
+                    session.message = f'{location.hostname} 授权页面暂不可用（HTTP {status}），已保留登录缓存，请稍后重试。'
+                    return True
                 session.status, session.stage = 'manual_required', 'upstream_blocked'
                 session.message = (f'{location.hostname} 授权页面返回 HTTP {status}，站点拒绝访问或要求验证；'
                                    '已保留登录缓存，未判定凭据失效。请检查站点验证或网络，无需反复重新输入账号密码。')
@@ -709,7 +771,9 @@ class LoginFlow:
                 return
             session.checkin_result = {'profile': profile, 'session': cookie,
                                       'site_cookies': getattr(session, 'site_cookies', []),
-                                      'oauth_cookies': getattr(session, 'oauth_cookies', [])}
+                                      'oauth_cookies': getattr(session, 'oauth_cookies', []),
+                                      **({'oauth_user_agent': session.oauth_user_agent}
+                                         if getattr(session, 'oauth_user_agent', None) else {})}
             session.status = 'success'
         else:
             await self._persist(session, profile, cookie)
@@ -763,6 +827,7 @@ class LoginFlow:
             client_id = await self._wait_oauth_config(page, provider, session.method)
             if not client_id:
                 session.status, session.stage = 'failed', 'provider_config_unavailable'
+                session.retryable = getattr(session, 'checkin_background', False)
                 session.message = '目标平台尚未加载有效的登录配置，未打开上游授权页。请稍后重试。'
                 return False
             session.stage = 'opening_oauth'
@@ -928,7 +993,8 @@ class LoginFlow:
                                                      quota, used, provider=session.provider,
                                                      name=session.name, interval_hours=session.interval_hours,
                                                      site_cookies=getattr(session, 'site_cookies', []),
-                                                     oauth_cookies=getattr(session, 'oauth_cookies', []))
+                                                     oauth_cookies=getattr(session, 'oauth_cookies', []),
+                                                     oauth_user_agent=getattr(session, 'oauth_user_agent', None))
                 except ValueError as error:
                     session.status, session.message = 'failed', str(error)
                     return
@@ -943,6 +1009,7 @@ class LoginFlow:
                     'interval_hours': session.interval_hours, 'enabled': True,
                     'session': session_cookie, 'api_user': str(profile['id']), 'login_via': login_via,
                     'oauth_cookies': getattr(session, 'oauth_cookies', []),
+                    'oauth_user_agent': getattr(session, 'oauth_user_agent', None),
                     'site_cookies': getattr(session, 'site_cookies', []),
                 })
                 known_balance = quota is not None and used is not None

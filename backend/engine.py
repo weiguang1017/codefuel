@@ -13,6 +13,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from .providers import PROVIDERS
 from .quota import quota_snapshot
 from .cookies import site_cookies
+from .retry import RETRY_DELAYS, transient_error, transient_status
 from .upstream_imports import (get_playwright_proxy, login_with_credentials, prepare_browser_page,
                                wait_for_waf_ready)
 
@@ -206,8 +207,23 @@ class CheckinEngine:
 
     async def run(self, row, credentials, previous_snapshot=False):
         start = time.monotonic()
+        for attempt in range(len(RETRY_DELAYS) + 1):
+            result = await self._run_once(row, credentials, previous_snapshot)
+            retryable = result.pop('_retryable', False)
+            if not retryable or attempt == len(RETRY_DELAYS):
+                if attempt:
+                    result['message'] += f' 连接阶段已自动重试 {attempt} 次。'
+                result['duration_ms'] = int((time.monotonic() - start) * 1000)
+                return result
+            await asyncio.sleep(RETRY_DELAYS[attempt])
+
+    async def _run_once(self, row, credentials, previous_snapshot=False):
+        start = time.monotonic()
         provider = PROVIDERS[row['provider']]
         result = {'status': 'failed', 'message': '签到失败。', 'duration_ms': 0, 'reward': None}
+        # Only the read-only preparation may be restarted. OAuth has its own
+        # retry boundary, so never repeat a login because a later read failed.
+        may_retry = row['provider'] == 'agentrouter' and row['auth_mode'] == 'session'
         try:
             if row['auth_mode'] == 'password':
                 login = await login_with_credentials(row['name'], provider, row['provider'], credentials['email'], credentials['password'])
@@ -233,6 +249,7 @@ class CheckinEngine:
                     if (before.get('status') == 401 and row['provider'] == 'agentrouter'
                             and row['auth_mode'] == 'session' and credentials.get('oauth_cookies')
                             and self.reauthenticate):
+                        may_retry = False
                         await self._run_agentrouter_relogin(row, api_user, result, None, credentials)
                         return result
                     if before.get('status') in (401, 403):
@@ -240,7 +257,8 @@ class CheckinEngine:
                                 if row['auth_mode'] == 'session' else '账号验证未通过，请检查邮箱与密码后重试。')
                         result.update(status='manual_required', message=hint)
                     else:
-                        result.update(status='failed', message=before['error'])
+                        result.update(status='failed', message=before['error'],
+                                      _retryable=may_retry and transient_status(before.get('status')))
                     return result
                 before_balance, before_total = before['balance'], before['total']
                 if row['auth_mode'] == 'session' and hasattr(client, 'export_site_cookies'):
@@ -263,6 +281,7 @@ class CheckinEngine:
                                   total_quota=before_total,
                                   message='余额已同步，尚无本次签到凭据。AgentRouter 通过登录领取奖励。')
                     if row['auth_mode'] == 'session':
+                        may_retry = False
                         await self._run_agentrouter_relogin(row, api_user, result, before, credentials)
                     return result
                 result.update(status=status, message=message, before_balance=before_balance)
@@ -281,10 +300,11 @@ class CheckinEngine:
             result.update(status='manual_required', message=(
                 'AgentRouter 未能取得站点所需的防护 Cookie（acw_tc），本次未发送账号请求。'
                 '请检查代理和网络，或稍后重试。'))
-        except (httpx.HTTPError, TimeoutError, PlaywrightTimeoutError):
-            result.update(message='网络连接失败或站点页面加载超时，未确认签到结果；请检查网络或代理设置后重试。')
+        except (httpx.HTTPError, TimeoutError, PlaywrightTimeoutError) as exc:
+            result.update(message='网络连接失败或站点页面加载超时，未确认签到结果；请检查网络或代理设置后重试。',
+                          _retryable=may_retry and transient_error(exc))
         except Exception as exc:
-            result.update(status='failed', message=(
+            result.update(status='failed', _retryable=may_retry and transient_error(exc), message=(
                 f'浏览器执行异常（{type(exc).__name__}），未确认签到结果；'
                 '请重试，若持续发生请导出日志反馈。'
             ))
@@ -302,7 +322,7 @@ class CheckinEngine:
         except TimeoutError:
             fresh = None
         if not fresh or not isinstance(fresh.get('profile'), dict):
-            result.update(status='manual_required', message=(
+            result.update(status='failed' if fresh and fresh.get('retryable') else 'manual_required', message=(
                 ('余额已同步，但' if before else '') +
                 (fresh.get('message') if isinstance(fresh, dict) and fresh.get('message') else
                  '后台授权未完成，已保留缓存；尚不能判断登录会话是否过期。请检查站点状态或网络。')))
@@ -318,8 +338,11 @@ class CheckinEngine:
                               'AgentRouter 登录完成，但未返回签到确认标记。',
                       _session_update={**result.get('_session_update', {}),
                                        **({'site_cookies': fresh['site_cookies']} if fresh.get('site_cookies') else {}),
+                                       **({'oauth_user_agent': fresh['oauth_user_agent']} if fresh.get('oauth_user_agent') else {}),
                                        'session': fresh['session'], 'api_user': str(api_user),
                                        'oauth_cookies': fresh.get('oauth_cookies', credentials['oauth_cookies'])})
+        if fresh.get('attempts', 1) > 1:
+            result['message'] += f' 授权阶段已自动重试 {fresh["attempts"] - 1} 次。'
         after = quota_snapshot(profile)
         if after is None:
             # Do not label the pre-login snapshot as the post-login balance.
@@ -357,7 +380,8 @@ class CheckinEngine:
                 return {'status': 200, 'waf': True,
                         'error': '站点触发人机验证（滑动验证），未取得账号数据，未能执行签到。'}
             if response['status'] != 200:
-                return {'status': response['status'], 'error': f'无法读取账号信息（HTTP {response["status"]}），请重新登录。'}
+                hint = '请稍后重试。' if transient_status(response['status']) else '请检查登录状态或站点访问限制。'
+                return {'status': response['status'], 'error': f'无法读取账号信息（HTTP {response["status"]}），{hint}'}
             body = response['body']
             if not isinstance(body, dict) or body.get('success') is not True or not isinstance(body.get('data'), dict):
                 return {'status': 200, 'error': '账号信息验证未通过，请检查凭据是否有效。'}

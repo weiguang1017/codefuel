@@ -3,14 +3,15 @@ import json
 from urllib.parse import urlsplit
 
 
-async def setup_notice_guard(context, domain):
+async def setup_notice_guard(context, domain, *, additional_origins=()):
     url = urlsplit(domain)
     origin = f'{url.scheme}://{url.netloc}'
+    origins = [origin, *additional_origins]
     script = r'''(() => {
-      if (location.origin !== ORIGIN || window.top !== window) return;
+      if (!ORIGINS.includes(location.origin) || window.top !== window) return;
       const visible = el => el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden';
       const dismiss = () => {
-        for (const modal of document.querySelectorAll('[role="dialog"], .semi-modal-content')) {
+        for (const modal of document.querySelectorAll('[role="dialog"], dialog[open], .semi-modal-content, .d-modal__container')) {
           if (!visible(modal)) continue;
           const text = modal.innerText || '';
           if (/滑动|人机|验证码|验证|captcha|turnstile|授权|权限|同意|条款|consent|permission/i.test(text)
@@ -29,10 +30,11 @@ async def setup_notice_guard(context, domain):
       let timer;
       const start = () => {
         new MutationObserver(() => { clearTimeout(timer); timer = setTimeout(dismiss, 100); })
-          .observe(document.documentElement, {childList: true, subtree: true});
+          .observe(document.documentElement, {childList: true, subtree: true, attributes: true,
+            attributeFilter: ['class', 'style', 'hidden', 'open']});
         dismiss();
       };
       if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, {once:true});
       else start();
     })();'''
-    await context.add_init_script(script.replace('ORIGIN', json.dumps(origin)))
+    await context.add_init_script(script.replace('ORIGINS', json.dumps(origins)))

@@ -127,7 +127,7 @@ class Store:
         return self.db.execute('SELECT * FROM accounts WHERE id=?', (account_id,)).fetchone()
 
     def add_account(self, data):
-        encrypted = self.encrypt_credentials({k: data[k] for k in ('email', 'password', 'session', 'api_user', 'oauth_cookies', 'site_cookies') if data.get(k)})
+        encrypted = self.encrypt_credentials({k: data[k] for k in ('email', 'password', 'session', 'api_user', 'oauth_cookies', 'site_cookies', 'oauth_user_agent') if data.get(k)})
         now = utcnow()
         with self.lock:
             cur = self.db.execute('INSERT INTO accounts (name,provider,auth_mode,encrypted,enabled,interval_hours,next_run,created_at,login_via) VALUES(?,?,?,?,?,?,?,?,?)',
@@ -137,7 +137,7 @@ class Store:
             return cur.lastrowid
 
     def apply_login(self, account_id, session, api_user, login_via, balance=None, used_quota=None, *, provider,
-                    name=None, interval_hours=None, oauth_cookies=None, site_cookies=None):
+                    name=None, interval_hours=None, oauth_cookies=None, site_cookies=None, oauth_user_agent=None):
         """保存前再次核对平台、运行状态和已有站点身份。"""
         with self.lock:
             row = self.account(account_id)
@@ -153,6 +153,7 @@ class Store:
             updates = {'auth_mode': 'session',
                        'encrypted': self.encrypt_credentials({'session': session, 'api_user': str(api_user),
                                                               **({'site_cookies': site_cookies} if site_cookies else {}),
+                                                              **({'oauth_user_agent': oauth_user_agent} if oauth_user_agent else {}),
                                                               'oauth_cookies': oauth_cookies or []}),
                        'login_via': login_via, 'status': 'idle', 'last_message': '登录状态已更新'}
             if name:
