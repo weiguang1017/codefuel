@@ -36,7 +36,8 @@ jobs:
         run: uv sync --locked --dev --python ${{ matrix.python }}
 
       - name: 运行测试
-        run: uv run --locked pytest -q
+        # 原生 Chrome 授权测试需要图形显示；Ubuntu runner 已预装 Xvfb。
+        run: xvfb-run -a uv run --locked pytest -q
 
   build:
     name: 编译验证 · ${{ matrix.name }}

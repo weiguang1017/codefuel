@@ -30,7 +30,9 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
       - run: uv sync --locked --dev
-      - run: uv run --locked pytest -q
+      - name: 运行测试
+        # 与 CI 一样，为原生 Chrome 授权测试提供虚拟显示。
+        run: xvfb-run -a uv run --locked pytest -q
 
   build-macos:
     name: 构建 macOS · ${{ matrix.arch }}
