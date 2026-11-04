@@ -4,16 +4,14 @@
 
 面向开发者的桌面签到与额度控制台，自动完成 **AnyRouter** 与 **AgentRouter** 的每日签到，集中展示额度、运行记录与调度状态。仅支持 macOS 与 Windows 桌面端。
 
-## 🎁 注册即多得 $50.00 额度
+## 官方平台
 
-还没注册账号？通过下面的专属链接注册，**可额外获得 $50.00 奖励额度**：
-
-| 平台 | 专属注册链接 |
+| 平台 | 官方地址 |
 |---|---|
-| **AgentRouter** | <https://agentrouter.org/register?aff=MBCp> |
-| **AnyRouter** | <https://anyrouter.top/register?aff=x73u> |
+| **AgentRouter** | <https://agentrouter.org> |
+| **AnyRouter** | <https://anyrouter.top> |
 
-注册后把账号加进码粮，每日签到即可持续累积额度。
+注册并创建账号后，可添加到码粮进行每日签到与额度管理。
 
 ## 特性
 
@@ -135,4 +133,6 @@ build\build_windows.bat          # Windows：产出 dist\CodeFuel\CodeFuel.exe
 
 ## 许可
 
-签到逻辑部分改编自上游代码，遵循 BSD-2-Clause；版权声明、许可条件与免责声明见项目根目录的 `THIRD_PARTY_NOTICES.md`，打包应用也会附带该文件。
+本项目采用 MIT 许可。签到逻辑部分改编自上游代码，遵循 BSD-2-Clause；版权声明、许可条件与免责声明见项目根目录的 `THIRD_PARTY_NOTICES.md`，打包应用也会附带该文件。
+
+本项目认可 [LINUX DO](https://linux.do) 社区，感谢佬友们的讨论与反馈。
