@@ -3,6 +3,8 @@ import asyncio
 import csv
 import io
 import secrets
+import httpx
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -13,14 +15,16 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator, model_validator
 from .store import Store, utcnow, iso
 from .engine import CheckinEngine, browser_available
-from .login_flow import LoginFlow, LoginConflict
-from .providers import PROVIDERS, BROWSER_METHODS, CREDENTIAL_METHODS, provider_catalog, supports
+from .login_flow import LoginFlow, LoginConflict, ACTIVE_STATUSES
+from .providers import (PROVIDERS, BROWSER_METHODS, CREDENTIAL_METHODS, provider_catalog,
+                        supports, CustomProviderIn, load_custom_providers)
 from .paths import APP_NAME, APP_VERSION, resource_root
 from .proxy import ProxyConfig, normalize_proxy
 
 ROOT = resource_root()
 CSRF = secrets.token_urlsafe(24)
 store = Store()
+load_custom_providers(store.provider_configs())
 login_flow = LoginFlow(store)
 
 
@@ -121,6 +125,16 @@ app = FastAPI(title=APP_NAME, version=APP_VERSION, lifespan=lifespan, docs_url=N
 @app.exception_handler(RequestValidationError)
 async def invalid_request(request, error):
     # FastAPI's default errors echo submitted inputs, including proxy passwords.
+    if request.url.path.startswith('/api/providers'):
+        labels = {'name': '站点名称', 'domain': 'HTTPS 根网址（不含账号、路径或参数）',
+                  'template': '签到模式', 'login_path': '登录页面路径', 'sign_in_path': '签到接口路径',
+                  'user_info_path': '余额接口路径', 'api_user_key': '用户标识请求头（不能使用保留头）',
+                  'quota_per_unit': '额度换算值', 'currency': '额度单位'}
+        fields = list(dict.fromkeys(item['loc'][-1] for item in error.errors() if item['loc'][-1] in labels))
+        detail = ('站点配置无效，请检查：' + '、'.join(labels[field] for field in fields)
+                  if fields else '站点配置包含不支持的字段或格式。')
+        return JSONResponse(status_code=422, content={'detail': detail,
+                            'fields': fields})
     proxy_error = any('proxy' in item['loc'] for item in error.errors())
     return JSONResponse(status_code=422, content={'detail': (
         '代理配置无效：请检查协议、主机和端口；认证信息须单独填写，SOCKS5 仅支持无认证。'
@@ -197,10 +211,100 @@ async def execute(account_id, trigger):
 @app.get('/api/bootstrap')
 def bootstrap():
     available = browser_available()
-    return {**store.dashboard(), 'csrf_token': CSRF, 'providers': provider_catalog(),
+    with store.lock:
+        dashboard = store.dashboard()
+        catalog = provider_catalog()
+        for provider in catalog:
+            provider['account_count'] = sum(a['provider'] == provider['id'] for a in dashboard['accounts'])
+            provider['units_locked'] = bool(provider['account_count'] or store.db.execute(
+                'SELECT 1 FROM runs WHERE provider=? LIMIT 1', (provider['id'],)).fetchone())
+    return {**dashboard, 'csrf_token': CSRF, 'providers': catalog,
             'engine': {'status': 'ready' if available else 'browser_required', 'version': APP_VERSION,
                        'browser_available': available,
                        'login_methods': list(BROWSER_METHODS + CREDENTIAL_METHODS)}}
+
+
+def editable_provider(provider_id):
+    provider = PROVIDERS.get(provider_id)
+    if not provider or not provider.active:
+        raise HTTPException(404, '站点不存在')
+    if not provider.custom:
+        raise HTTPException(409, '内置站点不可修改或移除')
+    rows = [r for r in store.accounts() if r['provider'] == provider_id]
+    if (any(r['id'] in active or r['id'] in queued or r['status'] in ('queued', 'running') for r in rows)
+            or any(s.provider == provider_id and s.status in ACTIVE_STATUSES for s in login_flow.sessions.values())):
+        raise HTTPException(409, '该站点正在排队、签到或授权，请结束后再修改')
+    return provider, rows
+
+
+def check_duplicate_domain(domain, provider_id=None):
+    if any(p.active and p.domain == domain and key != provider_id for key, p in PROVIDERS.items()):
+        raise HTTPException(409, '该网址已存在，请直接在已有站点下添加账号')
+
+
+@app.post('/api/providers', status_code=201)
+async def create_provider(data: CustomProviderIn):
+    with store.lock:
+        check_duplicate_domain(data.domain)
+        provider_id = 'custom_' + uuid.uuid4().hex
+        store.save_provider(provider_id, data.model_dump())
+        PROVIDERS[provider_id] = data.provider(provider_id)
+    return {'id': provider_id}
+
+
+@app.put('/api/providers/{provider_id}')
+async def update_provider(provider_id: str, data: CustomProviderIn):
+    with store.lock:
+        previous, rows = editable_provider(provider_id)
+        check_duplicate_domain(data.domain, provider_id)
+        if rows and previous.domain != data.domain:
+            raise HTTPException(409, '站点已关联账号，不能更改网址；请新增站点并重新授权')
+        has_history = store.db.execute('SELECT 1 FROM runs WHERE provider=? LIMIT 1', (provider_id,)).fetchone()
+        if (rows or has_history) and (previous.currency != data.currency or previous.quota_per_unit != data.quota_per_unit):
+            raise HTTPException(409, '站点已有账号或日志，不能更改额度单位与换算；请新增站点')
+        store.save_provider(provider_id, data.model_dump())
+        PROVIDERS[provider_id] = data.provider(provider_id)
+    return {'ok': True}
+
+
+@app.delete('/api/providers/{provider_id}')
+async def delete_provider(provider_id: str):
+    with store.lock:
+        previous, rows = editable_provider(provider_id)
+        if rows:
+            raise HTTPException(409, '请先移除该站点下的账号，再移除站点')
+        # Keep the definition for historical names and units; it is no longer selectable.
+        config = next(item['config'] for item in store.provider_configs() if item['id'] == provider_id)
+        store.save_provider(provider_id, config, active=False)
+        PROVIDERS[provider_id] = CustomProviderIn(**config).provider(provider_id, active=False)
+    return {'ok': True}
+
+
+@app.post('/api/providers/probe')
+async def probe_provider(data: CustomProviderIn):
+    """Read public capabilities without cookies, account credentials or a check-in POST."""
+    try:
+        async with asyncio.timeout(12), httpx.AsyncClient(timeout=10, follow_redirects=False, trust_env=False) as client:
+            async with client.stream('GET', data.domain + '/api/status') as response:
+                if response.status_code != 200:
+                    return {'recognized': False, 'message': f'公开配置返回 HTTP {response.status_code}；可保存配置，兼容性待登录验证。'}
+                raw = bytearray()
+                async for chunk in response.aiter_bytes():
+                    raw.extend(chunk)
+                    if len(raw) > 262144:
+                        return {'recognized': False, 'message': '公开配置过大，无法识别。'}
+        import json
+        body = json.loads(raw)
+        config = body.get('data') if isinstance(body, dict) else None
+        if not isinstance(config, dict) or body.get('success') is not True or 'system_name' not in config:
+            raise ValueError('unrecognized')
+        enabled = config.get('checkin_enabled')
+        return {'recognized': True, 'checkin_enabled': enabled if isinstance(enabled, bool) else None,
+                'message': ('已识别 New API 公开配置，标准签到已开启；仍需登录后验证接口。' if enabled is True else
+                            '已识别公开配置，标准签到已关闭；可选择仅同步余额或核对自定义签到接口。' if enabled is False else
+                            '已识别公开配置，未声明标准签到能力；请核对签到路径。')}
+    except (httpx.HTTPError, ValueError, UnicodeError, TimeoutError):
+        return {'recognized': False, 'message': '未取得可识别的公开配置，请检查网址或网站防护；检测不影响手动保存。'}
 
 
 @app.post('/api/login/start', status_code=202)
@@ -249,9 +353,12 @@ def health():
 @app.post('/api/accounts', status_code=201)
 def create_account(data: AccountIn):
     try:
-        payload = data.model_dump()
-        payload['proxy'] = normalize_proxy(data.proxy)
-        return {'id': store.add_account(payload)}
+        with store.lock:
+            if not supports(data.provider, data.auth_mode):
+                raise HTTPException(409, '站点已被移除，请重新选择')
+            payload = data.model_dump()
+            payload['proxy'] = normalize_proxy(data.proxy)
+            return {'id': store.add_account(payload)}
     except ValueError:
         raise HTTPException(422, '代理认证信息不完整，请填写代理用户名和密码。') from None
 
@@ -328,10 +435,10 @@ def update_settings(data: SettingsIn):
 def export_logs():
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(['时间', '账号', '平台', '状态', '触发方式', '签到前', '签到后', '额度变化', '说明'])
+    writer.writerow(['时间', '账号', '平台', '状态', '触发方式', '签到前', '签到后', '额度变化', '说明', '额度单位'])
     for row in store.runs(1000):
         values = [row['started_at'], row['account_name'], row['provider'], row['status'], row['trigger'],
-                  row['before_balance'], row['after_balance'], row['reward'], row['message']]
+                  row['before_balance'], row['after_balance'], row['reward'], row['message'], row['currency']]
         writer.writerow(["'" + str(v) if isinstance(v, str) and v[:1] in ('=', '+', '-', '@') else v for v in values])
     return StreamingResponse(iter(['\ufeff' + output.getvalue()]), media_type='text/csv; charset=utf-8',
         headers={'Content-Disposition': 'attachment; filename=codefuel-logs.csv'})

@@ -42,11 +42,12 @@
     <a class="brand" href="#overview"><span class="brand-mark"><svg><use href="#i-terminal"/></svg></span><span>码粮 <span>CodeFuel</span><small>AI 额度签到与管理</small></span></a>
     <div class="nav-label">工作空间</div>
     <nav class="nav">
-      <button class="nav-item active" data-view="overview"><svg><use href="#i-grid"/></svg>概览<span class="nav-dot"></span></button>
-      <button class="nav-item" data-view="accounts"><svg><use href="#i-users"/></svg>账号管理<span id="nav-count">0</span></button>
-      <button class="nav-item" data-view="logs"><svg><use href="#i-list"/></svg>运行日志</button>
+      <button class="nav-item active" data-view="overview" aria-label="概览"><svg><use href="#i-grid"/></svg>概览<span class="nav-dot"></span></button>
+      <button class="nav-item" data-view="accounts" aria-label="账号管理"><svg><use href="#i-users"/></svg>账号管理<span id="nav-count">0</span></button>
+      <button class="nav-item" data-view="sites" aria-label="站点管理"><svg><use href="#i-layers"/></svg>站点管理</button>
+      <button class="nav-item" data-view="logs" aria-label="运行日志"><svg><use href="#i-list"/></svg>运行日志</button>
     </nav>
-    <div class="nav-label second">支持平台</div>
+    <div class="nav-label second">内置平台</div>
     <div class="provider-links" id="provider-links"></div>
     <a class="referral-card" href="https://agentrouter.org/register?aff=MBCp" target="_blank" rel="noopener"><svg><use href="#i-gift"/></svg><div>注册即多得 $50.00<span>AGENTROUTER · 专属链接 ↗</span></div></a>
     <div class="sidebar-bottom">
@@ -67,4 +68,5 @@
 <dialog id="modal"><div id="modal-content"></div></dialog>
 <div id="toast" role="status"></div>
 <script src="/assets/app.js" defer></script>
+<script src="/assets/providers.js" defer></script>
 </body></html>

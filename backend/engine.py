@@ -170,10 +170,12 @@ class BrowserSession:
 
     async def request(self, path, api_user, method='GET', payload=None):
         script = '''async (o) => {
-          const headers = {'new-api-user': o.user, 'X-Requested-With': 'XMLHttpRequest'};
+          const target = new URL(o.path, o.origin);
+          if (location.origin !== o.origin || target.origin !== o.origin) throw new Error('Unexpected site origin');
+          const headers = {[o.userHeader]: o.user, 'X-Requested-With': 'XMLHttpRequest'};
           const options = {method: o.method, headers, credentials: 'same-origin', cache: 'no-store', redirect: 'error'};
           if (o.payload !== null) { headers['Content-Type'] = 'application/json'; options.body = JSON.stringify(o.payload); }
-          const response = await fetch(o.path, options);
+          const response = await fetch(target.href, options);
           const text = await response.text();
           let body = null;
           try { body = JSON.parse(text); } catch (e) {}
@@ -182,7 +184,8 @@ class BrowserSession:
           const guarded = /text\\/html/i.test(type) || /aliyun_waf|滑动验证|访问验证/.test(text.slice(0, 4000));
           return {status: response.status, body, guarded, bytes: text.length};
         }'''
-        args = {'path': path, 'user': str(api_user), 'method': method, 'payload': payload}
+        args = {'path': path, 'user': str(api_user), 'method': method, 'payload': payload,
+                'userHeader': self.provider.api_user_key, 'origin': self.provider.domain}
         for attempt in range(CONTEXT_RETRIES):
             # 间隔发送，避免短时间内连发接口被判定为自动化流量。
             gap = REQUEST_SPACING - (time.monotonic() - self._last_request)
@@ -224,8 +227,10 @@ class CheckinEngine:
 
     async def _run_once(self, row, credentials, previous_snapshot=False):
         start = time.monotonic()
-        provider = PROVIDERS[row['provider']]
         result = {'status': 'failed', 'message': '签到失败。', 'duration_ms': 0, 'reward': None}
+        provider = PROVIDERS.get(row['provider'])
+        if not provider or not provider.active:
+            return {**result, 'message': '站点配置不存在或已移除，请检查站点管理。'}
         # Only the read-only preparation may be restarted. OAuth has its own
         # retry boundary, so never repeat a login because a later read failed.
         may_retry = row['provider'] == 'agentrouter' and row['auth_mode'] == 'session'
@@ -277,6 +282,20 @@ class CheckinEngine:
                 if provider.sign_in_path:
                     response = await client.request(provider.sign_in_path, api_user, method='POST', payload={})
                     status, message = classify_response(response['status'], response['body'])
+                    if provider.custom:
+                        body = response.get('body')
+                        if response.get('guarded'):
+                            status, message = 'manual_required', '站点要求人工验证，请在浏览器中处理后重试。'
+                        elif status == 'success':
+                            confirmed = body.get('success') is True
+                            if provider.template == 'sign_in' and 'success' not in body:
+                                confirmed = ((type(body.get('ret')) is int and body['ret'] == 1)
+                                             or (type(body.get('code')) is int and body['code'] == 0))
+                            if not confirmed:
+                                status, message = 'failed', '签到接口未明确确认成功，请检查接口配置。'
+                        elif status == 'failed':
+                            # Do not persist arbitrary responses that might echo credentials.
+                            message = '签到未获确认，请检查签到路径、登录状态或站点兼容性。'
                     # Preserve the explicit check-in acknowledgement even when
                     # the subsequent balance request times out.
                     result.update(status=status, message=message, before_balance=before_balance)
@@ -290,8 +309,9 @@ class CheckinEngine:
                     result.update(status='synced', before_balance=before_balance,
                                   after_balance=before_balance, used_quota=before['used_quota'],
                                   total_quota=before_total,
-                                  message='余额已同步，尚无本次签到凭据。AgentRouter 通过登录领取奖励。')
-                    if row['auth_mode'] == 'session':
+                                  message=('余额已同步，尚无本次签到凭据。AgentRouter 通过登录领取奖励。'
+                                           if row['provider'] == 'agentrouter' else '余额已同步；此站点配置为仅同步余额，未执行签到。'))
+                    if row['provider'] == 'agentrouter' and row['auth_mode'] == 'session':
                         may_retry = False
                         await self._run_agentrouter_relogin(row, api_user, result, before, credentials)
                     return result
@@ -306,7 +326,8 @@ class CheckinEngine:
                 elif status == 'already_checked':
                     result['reward'] = 0
                 if result['reward'] is not None and result['reward'] > 0:
-                    result['message'] += f' 本次额度增加 ${result["reward"]:.2f}。'
+                    unit = {'USD': '$', 'CNY': '¥', 'credits': '积分 '}.get(provider.currency, '')
+                    result['message'] += f' 本次额度增加 {unit}{result["reward"]:.2f}。'
         except WAFCookiesUnavailable:
             result.update(status='manual_required', message=(
                 'AgentRouter 未能取得站点所需的防护 Cookie（acw_tc），本次未发送账号请求。'
@@ -397,7 +418,7 @@ class CheckinEngine:
             if not isinstance(body, dict) or body.get('success') is not True or not isinstance(body.get('data'), dict):
                 return {'status': 200, 'error': '账号信息验证未通过，请检查凭据是否有效。'}
             data = body['data']
-            snapshot = quota_snapshot(data)
+            snapshot = quota_snapshot(data, getattr(provider, 'quota_per_unit', 500000))
             if snapshot is None:
                 return {'error': '账号余额字段缺失或格式异常，保留上次余额。'}
             if data.get('id') is not None and str(data['id']) != str(api_user):

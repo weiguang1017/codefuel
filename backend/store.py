@@ -9,6 +9,7 @@ from pathlib import Path
 from cryptography.fernet import Fernet, InvalidToken
 from .paths import DB_NAME, data_dir
 from .proxy import public_proxy
+from .providers import PROVIDERS
 
 DATA_DIR = data_dir()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -24,6 +25,10 @@ def utcnow():
 
 def iso(dt=None):
     return (dt or utcnow()).isoformat(timespec='seconds')
+
+
+def amount_group(row):
+    return f'credits:{row["provider"]}' if row['currency'] == 'credits' else row['currency']
 
 
 class Store:
@@ -67,16 +72,34 @@ class Store:
             message TEXT, duration_ms INTEGER
         );
         CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS custom_providers (
+            id TEXT PRIMARY KEY, config TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1
+        );
         ''')
         columns = {row['name'] for row in self.db.execute('PRAGMA table_info(accounts)').fetchall()}
         if 'login_via' not in columns:
             self.db.execute('ALTER TABLE accounts ADD COLUMN login_via TEXT')
+        run_columns = {row['name'] for row in self.db.execute('PRAGMA table_info(runs)').fetchall()}
+        if 'currency' not in run_columns:
+            self.db.execute("ALTER TABLE runs ADD COLUMN currency TEXT NOT NULL DEFAULT 'USD'")
         if not self.db.execute('SELECT 1 FROM settings WHERE key="scheduler"').fetchone():
             self.db.execute('INSERT INTO settings VALUES("scheduler",?)', (json.dumps({'enabled': True, 'interval_hours': 6}),))
         self.db.commit()
 
     def close(self):
         self.db.close()
+
+    def provider_configs(self):
+        with self.lock:
+            return [{'id': r['id'], 'config': json.loads(r['config']), 'active': bool(r['active'])}
+                    for r in self.db.execute('SELECT * FROM custom_providers ORDER BY rowid')]
+
+    def save_provider(self, provider_id, config, *, active=True):
+        with self.lock:
+            self.db.execute('INSERT INTO custom_providers(id,config,active) VALUES(?,?,?) '
+                            'ON CONFLICT(id) DO UPDATE SET config=excluded.config,active=excluded.active',
+                            (provider_id, json.dumps(config), int(active)))
+            self.db.commit()
 
     def recover_interrupted(self):
         """Mark unfinished work honestly on restart; never claim it completed."""
@@ -119,6 +142,8 @@ class Store:
         data['enabled'] = bool(row['enabled'])
         data['login_via'] = row['login_via'] if 'login_via' in row.keys() else None
         data['proxy'] = public_proxy(self.credentials(row).get('proxy'))
+        provider = PROVIDERS.get(row['provider'])
+        data['currency'] = provider.currency if provider else 'USD'
         return data
 
     def accounts(self, enabled_only=False):
@@ -215,8 +240,9 @@ class Store:
     def begin_run(self, row, trigger):
         with self.lock:
             self.patch(row['id'], status='running', last_message='正在验证账号并执行签到…')
-            cur = self.db.execute('INSERT INTO runs (account_id,account_name,provider,status,trigger_type,started_at) VALUES(?,?,?,?,?,?)',
-                (row['id'], row['name'], row['provider'], 'running', trigger, iso()))
+            provider = PROVIDERS.get(row['provider'])
+            cur = self.db.execute('INSERT INTO runs (account_id,account_name,provider,status,trigger_type,started_at,currency) VALUES(?,?,?,?,?,?,?)',
+                (row['id'], row['name'], row['provider'], 'running', trigger, iso(), provider.currency if provider else 'USD'))
             self.db.commit()
             return cur.lastrowid
 
@@ -239,16 +265,29 @@ class Store:
     def dashboard(self):
         accounts = [self.public_account(r) for r in self.accounts()]
         runs = self.runs()
-        known = [a['balance'] for a in accounts if a['balance'] is not None]
+        known = [a['balance'] for a in accounts if a['balance'] is not None and a['currency'] == 'USD']
         today = utcnow().date().isoformat()
         today_runs = [r for r in runs if r['started_at'].startswith(today)]
         trend = []
         for i in range(6, -1, -1):
             day = (utcnow() - timedelta(days=i)).date().isoformat()
             rs = [r for r in runs if r['started_at'].startswith(day)]
-            trend.append({'date': day[5:], 'reward': round(sum(r['reward'] or 0 for r in rs), 2), 'runs': len(rs)})
+            trend.append({'date': day[5:], 'reward': round(sum(r['reward'] or 0 for r in rs if r['currency'] == 'USD'), 2), 'runs': len(rs)})
+        currencies = sorted({'USD'} | {amount_group(a) for a in accounts} | {amount_group(r) for r in runs})
+        amounts = {}
+        trends = {}
+        for currency in currencies:
+            balances = [a['balance'] for a in accounts if a['balance'] is not None and amount_group(a) == currency]
+            amounts[currency] = {'balance': round(sum(balances), 2) if balances else None,
+                                 'today_reward': round(sum(r['reward'] or 0 for r in today_runs if amount_group(r) == currency), 2)}
+            trends[currency] = []
+            for i in range(6, -1, -1):
+                day = (utcnow() - timedelta(days=i)).date().isoformat()
+                rs = [r for r in runs if r['started_at'].startswith(day) and amount_group(r) == currency]
+                trends[currency].append({'date': day[5:], 'reward': round(sum(r['reward'] or 0 for r in rs), 2), 'runs': len(rs)})
         return {'accounts': accounts, 'runs': runs, 'settings': self.settings(),
+                'amounts': amounts, 'trends': trends,
                 'stats': {'balance': round(sum(known), 2) if known else None,
-                          'today_reward': round(sum(r['reward'] or 0 for r in today_runs), 2),
+                          'today_reward': amounts['USD']['today_reward'],
                           'today_completed': len([r for r in today_runs if r['status'] in ('success', 'already_checked', 'synced')]),
                           'total_accounts': len(accounts)}, 'trend': trend}

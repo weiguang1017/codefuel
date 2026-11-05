@@ -1051,7 +1051,7 @@ class LoginFlow:
                 session.status, session.message = 'error', '未能读取登录凭据，请重新发起授权。'
                 return
             name = session.name or str(profile.get('username') or OAUTH_LABELS.get(session.method, '账号'))
-            snapshot = quota_snapshot(profile)
+            snapshot = quota_snapshot(profile, PROVIDERS[session.provider].quota_per_unit)
             quota = snapshot['balance'] if snapshot else None
             used = snapshot['used_quota'] if snapshot else None
             login_via = session.method if session.method in OAUTH_LABELS else 'manual'
