@@ -3,10 +3,11 @@ import os
 import shutil
 import sys
 from pathlib import Path
+from .version import get_version_info
 
 APP_NAME = '码粮 CodeFuel'
 APP_SLUG = 'CodeFuel'
-APP_VERSION = '1.0.1'
+APP_VERSION = get_version_info()['version']
 APP_SLOGAN = '为代码添粮，让灵感续航。'
 # 当前数据命名空间。改名前的 DailyQuota 会在首次启动时自动迁移过来。
 DATA_NAMESPACE = 'CodeFuel'

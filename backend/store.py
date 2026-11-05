@@ -82,6 +82,9 @@ class Store:
         run_columns = {row['name'] for row in self.db.execute('PRAGMA table_info(runs)').fetchall()}
         if 'currency' not in run_columns:
             self.db.execute("ALTER TABLE runs ADD COLUMN currency TEXT NOT NULL DEFAULT 'USD'")
+        # Restore accounts paused by the retired membership preview; preserve scheduling preferences and credentials.
+        self.db.execute("UPDATE accounts SET status='idle',last_message=? WHERE status='vip_required'",
+                        ('已恢复普通签到，等待下一次执行。',))
         if not self.db.execute('SELECT 1 FROM settings WHERE key="scheduler"').fetchone():
             self.db.execute('INSERT INTO settings VALUES("scheduler",?)', (json.dumps({'enabled': True, 'interval_hours': 6}),))
         self.db.commit()
@@ -260,7 +263,11 @@ class Store:
             self.db.commit()
 
     def runs(self, limit=100):
-        return [dict(r) | {'trigger': r['trigger_type']} for r in self.db.execute('SELECT * FROM runs ORDER BY id DESC LIMIT ?', (limit,)).fetchall()]
+        rows = [dict(r) | {'trigger': r['trigger_type']} for r in self.db.execute('SELECT * FROM runs ORDER BY id DESC LIMIT ?', (limit,)).fetchall()]
+        for row in rows:
+            if row['status'] == 'vip_required':
+                row['status'] = 'not_run'  # Historical outcome; keep the stored record and original reason.
+        return rows
 
     def dashboard(self):
         accounts = [self.public_account(r) for r in self.accounts()]

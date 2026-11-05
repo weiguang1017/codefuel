@@ -10,7 +10,7 @@ import urllib.request
 
 import webview
 
-from backend.paths import APP_NAME, data_dir
+from backend.paths import APP_NAME, APP_VERSION, data_dir
 
 PREFERRED_PORT = 8765
 WINDOW_SIZE = (1360, 900)
@@ -120,7 +120,8 @@ def run_smoke(port):
             try:
                 heading = window.evaluate_js(
                     "document.querySelector('h1') ? document.querySelector('h1').innerText : null")
-                if heading:
+                version = window.evaluate_js("document.querySelector('#app-version')?.textContent")
+                if heading and version == f'v{APP_VERSION}':
                     break
             except Exception:
                 continue
@@ -128,12 +129,14 @@ def run_smoke(port):
             report.update(heading=heading,
                           title=window.evaluate_js('document.title'),
                           brand=window.evaluate_js("document.querySelector('.brand').innerText"),
+                          version=window.evaluate_js("document.querySelector('#app-version').textContent"),
                           metrics=window.evaluate_js("document.querySelectorAll('.metric').length"),
                           nav=window.evaluate_js("document.querySelectorAll('.nav-item').length"))
         except Exception as error:  # noqa: BLE001
             report['error'] = repr(error)
         report['smoke'] = 'ok' if (heading == '为代码添粮，让灵感续航。'
                                   and 'CodeFuel' in report.get('brand', '')
+                                  and report.get('version') == f'v{APP_VERSION}'
                                   and report.get('metrics') == 4) else 'failed'
         print(json.dumps(report, ensure_ascii=False), flush=True)
         window.destroy()

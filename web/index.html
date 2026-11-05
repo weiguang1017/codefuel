@@ -40,6 +40,7 @@
 <div class="app-shell">
   <aside class="sidebar">
     <a class="brand" href="#overview"><span class="brand-mark"><svg><use href="#i-terminal"/></svg></span><span>码粮 <span>CodeFuel</span><small>AI 额度签到与管理</small></span></a>
+    <div class="sidebar-main">
     <div class="nav-label">工作空间</div>
     <nav class="nav">
       <button class="nav-item active" data-view="overview" aria-label="概览"><svg><use href="#i-grid"/></svg>概览<span class="nav-dot"></span></button>
@@ -49,11 +50,16 @@
     </nav>
     <div class="nav-label second">内置平台</div>
     <div class="provider-links" id="provider-links"></div>
-    <a class="referral-card" href="https://agentrouter.org/register?aff=MBCp" target="_blank" rel="noopener"><svg><use href="#i-gift"/></svg><div>注册即多得 $50.00<span>AGENTROUTER · 专属链接 ↗</span></div></a>
+    <section class="ad-placements" aria-label="广告合作">
+      <div class="ad-placements-heading"><span>广告合作</span><small>2 席开放中</small></div>
+      <button class="ad-slot" data-action="ad-inquiry" data-slot="1" aria-label="广告位 01 招商咨询"><span class="ad-slot-number">01</span><span class="ad-slot-copy"><strong>广告位招商</strong><small>点击洽谈合作</small></span><svg aria-hidden="true"><use href="#i-arrow"/></svg></button>
+      <button class="ad-slot" data-action="ad-inquiry" data-slot="2" aria-label="广告位 02 招商咨询"><span class="ad-slot-number">02</span><span class="ad-slot-copy"><strong>广告位招商</strong><small>点击洽谈合作</small></span><svg aria-hidden="true"><use href="#i-arrow"/></svg></button>
+    </section>
+    </div>
     <div class="sidebar-bottom">
       <button class="nav-item" data-action="settings"><svg><use href="#i-settings"/></svg>偏好设置</button>
       <div class="local-card"><svg><use href="#i-shield"/></svg><div>本地优先，凭据不出机<span>LOCAL-FIRST · ENCRYPTED</span></div></div>
-      <div class="version"><span class="status-dot"></span>本地服务运行中 <code>v1.0.1</code></div>
+      <div class="version"><span class="status-dot"></span>本地服务运行中 <code id="app-version">—</code></div>
     </div>
   </aside>
   <main class="main">

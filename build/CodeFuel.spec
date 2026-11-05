@@ -2,13 +2,18 @@
 """构建码粮 CodeFuel，只收集桌面运行所需文件。"""
 import sys
 from pathlib import Path
+from runpy import run_path
 
 from PyInstaller.utils.hooks import copy_metadata
 
 ROOT = Path(SPECPATH).resolve().parent
+version_file = ROOT / 'build' / 'generated' / 'build-info.json'
+version_info = run_path(str(ROOT / 'backend' / 'version.py'))['write_build_info'](ROOT, version_file)
+numeric_version = version_info['version'].split('-', 1)[0].split('+', 1)[0]
 
 # Include the required third-party notice with source and frozen distributions.
-datas = [(str(ROOT / 'web'), 'web'), (str(ROOT / 'THIRD_PARTY_NOTICES.md'), '.')]
+datas = [(str(ROOT / 'web'), 'web'), (str(ROOT / 'THIRD_PARTY_NOTICES.md'), '.'),
+         (str(version_file), '.')]
 for package in ('cloakbrowser', 'playwright'):
     datas += copy_metadata(package)
 
@@ -71,7 +76,8 @@ if sys.platform == 'darwin':
         name='CodeFuel.app',
         icon=str(ROOT / 'build' / 'icon.icns'),
         bundle_identifier='local.dailyquota.desktop',
-        info_plist={'CFBundleDisplayName': '码粮 CodeFuel'},
+        info_plist={'CFBundleDisplayName': '码粮 CodeFuel', 'CFBundleShortVersionString': numeric_version,
+                    'CFBundleVersion': numeric_version},
     )
 else:
     coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name='CodeFuel')

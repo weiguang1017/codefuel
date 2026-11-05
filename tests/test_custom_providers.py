@@ -67,6 +67,31 @@ def test_custom_site_lifecycle_and_restart(local):
     assert len([p for p in client.get('/api/bootstrap').json()['providers'] if not p['custom']]) == 2
 
 
+def test_retired_membership_pause_recovers_without_changing_user_settings(local):
+    client, db = local
+    provider_id = add(client)
+    first = account(client, provider_id)
+    second = account(client, provider_id)
+    run = db.begin_run(db.account(first), 'scheduled')
+    db.finish_run(run, first, {'status': 'vip_required', 'message': 'historical pause'}, 'scheduled')
+    db.patch(second, status='vip_required', enabled=0)
+    old_due = db.account(first)['next_run']
+    old_credentials = db.credentials(db.account(first))
+    reopened = Store(db.db_path, db.key_path)
+    try:
+        assert reopened.account(first)['status'] == 'idle'
+        assert reopened.account(first)['enabled'] == 1
+        assert reopened.account(first)['next_run'] == old_due
+        assert reopened.credentials(reopened.account(first)) == old_credentials
+        assert reopened.account(second)['status'] == 'idle' and reopened.account(second)['enabled'] == 0
+        assert reopened.runs()[0]['status'] == 'not_run'
+        assert reopened.db.execute('SELECT status FROM runs WHERE id=?', (run,)).fetchone()['status'] == 'vip_required'
+    finally:
+        reopened.close()
+    assert 'vip' not in client.get('/api/bootstrap').json()
+    assert client.post('/api/vip/checkout', json={}).status_code == 405
+
+
 @pytest.mark.parametrize('method', ['PUT', 'DELETE'])
 def test_builtins_are_readonly(local, method):
     client, _ = local

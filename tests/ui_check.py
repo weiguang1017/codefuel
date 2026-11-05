@@ -79,7 +79,7 @@ async def main():
         hrefs = await page.locator('.referral-link').evaluate_all('els => els.map(e => e.href)')
         assert 'https://agentrouter.org/register?aff=MBCp' in hrefs, hrefs
         assert 'https://anyrouter.top/register?aff=x73u' in hrefs, hrefs
-        assert await page.locator('.referral-card').count() == 1
+        assert await page.locator('.ad-slot').count() == 2
         await clean(page)
         await page.reload(wait_until='networkidle')
 

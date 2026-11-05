@@ -16,6 +16,7 @@ dist-new/
 build/pyinstaller-*/
 build/pyinstaller/
 build/.pyinstaller/
+build/generated/
 build/icon.iconset/
 build/*-selftest/
 build/test-*/
