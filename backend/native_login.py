@@ -1,8 +1,8 @@
-"""Human-operated Chrome authorization; attach only after the user returns.
+"""Human-operated Chrome authorization with short target-site-only automation phases.
 
 The temporary profile belongs to this login, never to the user's daily Chrome.
-While the human signs in, only the loopback tab list is read: no page scripting,
-automation connection, fingerprint overrides or challenge interaction.
+While the human signs in upstream, only the loopback tab list is read: no page
+scripting, automation connection, fingerprint overrides or challenge interaction.
 """
 import asyncio
 from contextlib import asynccontextmanager
@@ -12,13 +12,17 @@ import subprocess
 import tempfile
 import time
 from types import SimpleNamespace
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, quote
 
 import httpx
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, Error as PlaywrightError
 
 POLL_INTERVAL = 1.0
 RETURN_SETTLE = 2.0
+
+
+def has_challenge(pages):
+    return any(any(word in page.title.lower() for word in ('just a moment', '请稍候', '请稍等', 'attention required', 'checking your browser')) for page in pages)
 
 
 class NativeChrome:
@@ -76,8 +80,16 @@ class NativeChrome:
     async def tabs(self):
         response = await self.client.get('/json/list')
         response.raise_for_status()
-        return [SimpleNamespace(url=tab.get('url', ''), title=tab.get('title', ''))
+        return [SimpleNamespace(url=tab.get('url', ''), title=tab.get('title', ''), id=tab.get('id'))
                 for tab in response.json() if tab.get('type') == 'page']
+
+    async def open_target(self, url, *, close_tabs=()):
+        """Continue in this profile without connecting a page driver on the identity-provider page."""
+        response = await self.client.put('/json/new?' + quote(url, safe=':/'))
+        response.raise_for_status()
+        for tab_id in close_tabs:
+            if tab_id:
+                await self.client.get('/json/close/' + quote(tab_id, safe=''))
 
     @asynccontextmanager
     async def attached(self):
@@ -121,98 +133,198 @@ class NativeChrome:
                     await asyncio.sleep(.2 * (attempt + 1))
 
 
-async def run_native_login(flow, session):
-    from .engine import LOCAL_CHROME
-    from .login_flow import (ACTIVE_STATUSES, WINDOW_TIMEOUT, PROVIDERS, _origin,
-                             verify_target_profile, chrome_user_agent)
-    from .proxy import browser_proxy
-    from .upstream_imports import get_playwright_proxy
+async def _prepare_native_site(native, flow, session, provider):
+    """Briefly operate the target site, then disconnect as soon as upstream navigation starts."""
+    from .login_flow import _origin
+    from .agreements import accept_site_agreements
+    from .login_pages import discover_login_page
+    from .protocols import resolve_custom_protocol
+    metadata = await native.tabs()
+    if has_challenge(metadata) or any(urlsplit(p.url).hostname in ('linux.do', 'connect.linux.do') for p in metadata):
+        return False
+    async with native.attached() as (_, context):
+        if session.cancelled:
+            return False
+        if any(urlsplit(p.url).hostname in ('linux.do', 'connect.linux.do') for p in context.pages):
+            return False
+        pages = [p for p in context.pages if _origin(p.url) == _origin(provider.domain)]
+        if not pages:
+            return False
+        page = pages[-1]
+        leaving = asyncio.Event()
 
-    provider = PROVIDERS[session.provider]
+        def on_request(request):
+            if getattr(request, 'resource_type', None) != 'document':
+                return
+            location = urlsplit(request.url)
+            if location.scheme == 'https' and location.hostname in ('linux.do', 'connect.linux.do'):
+                leaving.set()
+
+        context.on('request', on_request)
+
+        async def prepare():
+            current = await discover_login_page(page, provider, flow.store)
+            await accept_site_agreements(page, current.domain)
+            current = await resolve_custom_protocol(page, current, flow.store)
+            if session.cancelled or _origin(page.url) != _origin(current.domain):
+                return False
+            # A visible site CAPTCHA must be completed in the unattached native window.
+            challenge = await page.evaluate('''() => [...document.querySelectorAll('iframe[src*="captcha"],iframe[src*="challenges.cloudflare"],.tcaptcha-popup,.nc-container')]
+                .some(el=>{const r=el.getBoundingClientRect(),s=getComputedStyle(el);return r.width>40&&r.height>40&&s.display!=='none'&&s.visibility!=='hidden'})''')
+            if challenge:
+                return False
+            await accept_site_agreements(page, current.domain)
+            if current.name == 'agentrouter':
+                # Its button can become enabled before the SPA receives the OAuth client ID.
+                client_id = await flow._wait_oauth_config(page, current, session.method)
+                if not client_id:
+                    return False
+                session.oauth_client_id = client_id
+            # No init scripts, UA overrides or navigation wait carry over into LinuxDO.
+            return await flow._click_oauth(context, page, session.method, current, no_wait_after=True)
+
+        work = asyncio.create_task(prepare())
+        departed = asyncio.create_task(leaving.wait())
+        try:
+            done, _ = await asyncio.wait({work, departed}, timeout=30, return_when=asyncio.FIRST_COMPLETED)
+            if leaving.is_set():
+                return True
+            return await work if work in done else False
+        finally:
+            for task in (work, departed):
+                if not task.done(): task.cancel()
+            await asyncio.gather(work, departed, return_exceptions=True)
+            context.remove_listener('request', on_request)
+
+
+async def _run_native_session(flow, session, provider, executable):
+    from .login_flow import ACTIVE_STATUSES, WINDOW_TIMEOUT, PROVIDERS, _origin, verify_target_profile, chrome_user_agent
+    from .protocols import ProtocolMismatch
+    from .proxy import browser_proxy
+    from .agreements import accept_site_agreements
+    from .upstream_imports import get_playwright_proxy
     try:
         if session.cancelled or session.status not in ACTIVE_STATUSES:
             return
         if session.account_id is not None:
             await flow.discard_browser_sessions(session.account_id)
         proxy = browser_proxy(getattr(session, 'account_proxy', None))
-        if proxy is None:
-            proxy = get_playwright_proxy(use_proxy=provider.use_proxy)
-        async with NativeChrome(LOCAL_CHROME, provider.domain + provider.login_path, proxy) as native:
+        if proxy is None: proxy = get_playwright_proxy(use_proxy=provider.use_proxy)
+        async with NativeChrome(executable, provider.domain + provider.login_path, proxy) as native:
             session.status, session.stage = 'waiting', 'native_login'
             session.verification_paused, session.verification_auto = True, False
-            instruction = ('请在新开的 Chrome 窗口点击 LinuxDO 登录，手动完成登录、真人验证和授权；'
-                           '返回 AgentRouter 后会自动检测并保存，也可点击下方按钮检测。')
+            session.message = '正在打开原生 Chrome；将自动处理本站登录协议并查找 LinuxDO 入口。真人验证请在浏览器中完成。'
             if native.proxy_auth_required:
-                instruction += ' 如 Chrome 弹出代理认证框，请输入该代理的用户名和密码。'
-            session.message = instruction
+                session.message += ' 如 Chrome 要求代理认证，请手动输入代理用户名和密码。'
             deadline = time.monotonic() + WINDOW_TIMEOUT
+            entry_attempted = False
+            site_since = returned_since = None
             upstream_seen = False
-            returned_since = None
             while time.monotonic() < deadline:
                 if session.cancelled or session.status not in ACTIVE_STATUSES:
                     return
                 if native.process.returncode is not None:
                     session.status, session.message = 'cancelled', '登录窗口已关闭，未保存账号。'
                     return
-                try:
-                    pages = await native.tabs()
+                try: pages = await native.tabs()
                 except (httpx.HTTPError, ValueError):
-                    await asyncio.sleep(POLL_INTERVAL)
-                    continue
+                    await asyncio.sleep(POLL_INTERVAL);continue
                 if not pages:
                     session.status, session.message = 'cancelled', '登录窗口已关闭，未保存账号。'
                     return
+                provider = PROVIDERS[session.provider]
                 pending = flow._upstream_auth_pending(session, SimpleNamespace(pages=pages))
-                if pending:
-                    upstream_seen = True
-                returned = [page for page in pages if _origin(page.url) == _origin(provider.domain)
-                            and urlsplit(page.url).path.rstrip('/') not in ('/login', '/register')
-                            and not urlsplit(page.url).path.startswith(('/oauth', '/api/'))]
-                # Do not attach while an upstream login, callback or visible
-                # challenge is pending. A tab URL alone never proves identity.
-                challenge = any(any(word in page.title.lower() for word in
-                                    ('just a moment', '请稍候', '请稍等', 'attention required')) for page in pages)
-                ready = bool(returned) and not pending and not challenge
+                challenge = has_challenge(pages)
+                upstream_seen = upstream_seen or pending
+                homes = [p for p in pages if flow._linuxdo_home(p.url)]
+                returned = [p for p in pages if _origin(p.url) == _origin(provider.domain)
+                            and not flow._is_login_page(p.url, provider)
+                            and not urlsplit(p.url).path.startswith(('/oauth', '/api/', '/auth/'))]
+                requested = session.resume_event.is_set();session.resume_event.clear()
+                continued = session.oauth_continue_event.is_set();session.oauth_continue_event.clear()
+                own = [p for p in pages if _origin(p.url) == _origin(provider.domain)]
+                if homes and not returned and not pending and not challenge:
+                    session.stage = 'linuxdo_home'
+                    session.verification_paused, session.verification_auto = False, False
+                    session.oauth_continue_available = session.linuxdo_continue_count < 3
+                    session.message = 'LinuxDO 当前停在社区首页。完成登录后点击「继续原站点授权」，会保留本次登录状态。'
+                    if continued and session.oauth_continue_available:
+                        session.linuxdo_continue_count += 1
+                        session.oauth_continue_available = False
+                        await native.open_target(provider.domain + provider.login_path,
+                                                 close_tabs=[getattr(p, 'id', None) for p in homes])
+                        entry_attempted = False;site_since = None
+                    await asyncio.sleep(POLL_INTERVAL);continue
+                session.oauth_continue_available = False
+                if pending or challenge:
+                    site_since = returned_since = None
+                    session.status, session.stage = 'waiting', 'native_login'
+                    session.verification_paused, session.verification_auto = True, False
+                    session.message = '请在原生 Chrome 中完成 LinuxDO 登录、真人验证和授权；验证期间应用不连接页面驱动，返回本站后自动保存。'
+                    await asyncio.sleep(POLL_INTERVAL);continue
+                ready = bool(returned) and upstream_seen
                 returned_since = (returned_since or time.monotonic()) if ready else None
-                requested = session.resume_event.is_set()
-                session.resume_event.clear()
-                automatic = upstream_seen and returned_since is not None and time.monotonic() - returned_since >= RETURN_SETTLE
-                if ready and (automatic or requested):
-                    # One attempt per return. If blocked, disconnect immediately
-                    # and let the human finish before an explicit new attempt.
+                if ready and (requested or time.monotonic() - returned_since >= RETURN_SETTLE):
                     upstream_seen = False
                     session.status, session.stage = 'verifying', 'verifying_target'
                     session.verification_paused = False
-                    session.message = '已返回 AgentRouter，正在确认本站账号身份…'
+                    session.message = '已返回原站点，正在确认本站身份并保存登录状态…'
                     async with native.attached() as (browser, context):
                         for page in reversed(context.pages):
-                            if _origin(page.url) != _origin(provider.domain):
+                            if _origin(page.url) != _origin(provider.domain) or flow._is_login_page(page.url, provider):
                                 continue
+                            from .protocols import resolve_custom_protocol
+                            provider = await resolve_custom_protocol(page, provider, flow.store)
+                            await accept_site_agreements(page, provider.domain)
                             cookie = await flow._session_cookie(context, provider)
-                            if not cookie:
-                                continue
-                            try:
-                                profile = await verify_target_profile(page, provider)
-                            except Exception:
-                                profile = None
+                            if not cookie: continue
+                            try: profile = await verify_target_profile(page, provider)
+                            except Exception: profile = None
                             if profile and cookie == await flow._session_cookie(context, provider):
-                                session.oauth_user_agent = await chrome_user_agent(browser)
+                                if session.provider == 'agentrouter':
+                                    session.oauth_user_agent = await chrome_user_agent(browser)
                                 await flow._complete_login(session, profile, cookie, context)
                                 return
-                    session.message = ('尚未确认 AgentRouter 登录成功。请在 Chrome 中完成登录和网站验证，'
-                                       '进入控制台后点击「已完成登录，检测并保存」。')
+                    session.message = '尚未确认本站登录成功，请在浏览器中完成验证；进入控制台后点击检测并保存。'
+                elif requested and returned:
+                    # Explicit verification retry, after an earlier blocked balance/identity request.
+                    upstream_seen = True;returned_since = None
+                elif any(flow._is_login_page(p.url, provider) for p in own) and not entry_attempted:
+                    site_since = site_since or time.monotonic()
+                    if time.monotonic() - site_since >= RETURN_SETTLE:
+                        entry_attempted = True
+                        session.stage = 'preparing_native_site'
+                        session.verification_paused, session.verification_auto = False, True
+                        session.message = '正在处理原站点的协议复选框与 LinuxDO 登录入口…'
+                        try:
+                            started = await _prepare_native_site(native, flow, session, provider)
+                            upstream_seen = upstream_seen or started
+                        except PlaywrightError:
+                            pass
+                        provider = PROVIDERS[session.provider]
+                        session.message = '请在浏览器中完成登录与授权；如未自动跳转，可点击站内 LinuxDO 按钮。'
                 elif requested:
-                    session.message = '浏览器尚未返回 AgentRouter 控制台；请先完成 LinuxDO 登录、真人验证和授权。'
+                    session.message = '浏览器尚未返回本站控制台，请先完成登录、真人验证与授权。'
                 session.status, session.stage = 'waiting', 'native_login'
                 session.verification_paused, session.verification_auto = True, False
                 await asyncio.sleep(POLL_INTERVAL)
-            session.status, session.message = 'expired', '等待授权超时，未确认 AgentRouter 身份，未保存账号。'
+            session.status, session.message = 'expired', '授权等待超时，尚未确认本站身份，未保存账号。'
     except asyncio.CancelledError:
-        if session.status in ACTIVE_STATUSES:
-            session.status, session.message = 'cancelled', '已取消授权。'
+        if session.status in ACTIVE_STATUSES: session.status, session.message = 'cancelled', '已取消授权。'
         raise
+    except ProtocolMismatch as error:
+        session.status, session.message = 'unavailable', str(error)
     except FileNotFoundError:
         session.status, session.message = 'failed', '未找到 Google Chrome，请安装后重试。'
     except Exception:
         if session.status in ACTIVE_STATUSES:
-            session.status, session.message = 'failed', 'Chrome 授权未能完成，请检查浏览器与该账号的网络代理后重试。'
+            session.status, session.message = 'failed', '原生 Chrome 登录未完成，请检查浏览器或所选代理后重试。'
+    finally:
+        session.oauth_continue_available = False
+        session.oauth_continue_event.clear()
+
+
+async def run_native_login(flow, session):
+    from .engine import LOCAL_CHROME
+    from .providers import PROVIDERS
+    await _run_native_session(flow, session, PROVIDERS[session.provider], LOCAL_CHROME)

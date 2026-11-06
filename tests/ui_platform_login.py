@@ -43,6 +43,7 @@ class API:
         self.accounts = copy.deepcopy(accounts or [])
         self.plans = list(plans or [])
         self.starts, self.cancels, self.updates, self.creates = [], [], [], []
+        self.continues = []
         self.resumes, self.polled_sessions = [], []
         self.sessions = {}
         self.polls = 0
@@ -120,6 +121,11 @@ class API:
                 self.resumes.append(sid)
                 session['verification_paused'] = False
                 return await route.fulfill(json={'id': sid, 'status': 'waiting', 'verification_paused': False})
+            if path.endswith('/continue-oauth'):
+                assert plan.get('home_wait') and not session['cancelled']
+                self.continues.append(sid)
+                session['home_continued'] = True
+                return await route.fulfill(json={'id': sid, 'status': 'waiting', 'stage': 'resuming_oauth', 'oauth_continue_available': False})
             self.polls += 1
             self.polled_sessions.append(sid)
             self.inflight += 1
@@ -129,6 +135,9 @@ class API:
                     plan['poll_entered'].set()
                 if plan.get('hold_poll'):
                     await plan['hold_poll'].wait()
+                if plan.get('home_wait') and not session.get('home_continued'):
+                    return await route.fulfill(json={'id': sid, 'status': 'waiting', 'stage': 'linuxdo_home',
+                        'oauth_continue_available': True, 'message': '浏览器停在 LinuxDO 社区首页，尚未完成原站点授权。请点击继续原站点授权。'})
                 if session.get('upstream_polls', 0) < plan.get('upstream_wait_polls', 0):
                     session['upstream_polls'] = session.get('upstream_polls', 0) + 1
                     return await route.fulfill(json={'id': sid, 'status': 'waiting', 'verification_paused': False,

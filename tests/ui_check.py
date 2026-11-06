@@ -100,7 +100,7 @@ async def main():
         await page.locator('input[name="password"]').fill('ui-test-not-a-real-account')
         await page.locator('#account-form button[type="submit"]').click()
         await page.locator('#modal').wait_for(state='hidden')
-        assert '邮箱密码' in await page.locator('.account-table').inner_text()
+        assert '账号密码' in await page.locator('.account-table').inner_text()
 
         # 2. Authorized account renders its real origin, and offers re-authorization.
         seed_authorized_account()

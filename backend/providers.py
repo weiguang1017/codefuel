@@ -26,6 +26,7 @@ class Provider(ProviderConfig):
     template: str = 'sign_in'
     quota_per_unit: float = 500000
     currency: str = 'USD'
+    login_api_path: str = '/api/user/login'
 
 
 class CustomProviderIn(BaseModel):
@@ -33,10 +34,11 @@ class CustomProviderIn(BaseModel):
     model_config = ConfigDict(extra='forbid')
     name: str = Field(min_length=1, max_length=40)
     domain: str = Field(max_length=250)
-    template: Literal['newapi', 'sign_in', 'balance'] = 'newapi'
+    template: Literal['newapi', 'sign_in', 'balance', 'sub2api', 'sub2api_balance'] = 'newapi'
     login_path: str = Field(default='/login', max_length=200)
     sign_in_path: str | None = Field(default=None, max_length=200)
-    user_info_path: str = Field(default='/api/user/self', max_length=200)
+    user_info_path: str | None = Field(default=None, max_length=200)
+    login_api_path: str | None = Field(default=None, max_length=200)
     api_user_key: str = Field(default='new-api-user', max_length=64)
     quota_per_unit: float = Field(default=500000, ge=1, le=1e12, allow_inf_nan=False)
     currency: Literal['USD', 'CNY', 'credits'] = 'USD'
@@ -68,7 +70,7 @@ class CustomProviderIn(BaseModel):
             raise ValueError('端口无效')
         return 'https://' + host.rstrip('.') + (f':{port}' if port and port != 443 else '')
 
-    @field_validator('login_path', 'sign_in_path', 'user_info_path')
+    @field_validator('login_path', 'sign_in_path', 'user_info_path', 'login_api_path')
     @classmethod
     def validate_path(cls, value):
         if value is None:
@@ -91,16 +93,22 @@ class CustomProviderIn(BaseModel):
 
     @model_validator(mode='after')
     def apply_template(self):
-        if self.template == 'balance':
+        sub2api = self.template.startswith('sub2api')
+        self.user_info_path = self.user_info_path or ('/api/v1/auth/me' if sub2api else '/api/user/self')
+        self.login_api_path = self.login_api_path or ('/api/v1/auth/login' if sub2api else '/api/user/login')
+        if sub2api and 'quota_per_unit' not in self.model_fields_set:
+            self.quota_per_unit = 1
+        if self.template in ('balance', 'sub2api_balance'):
             self.sign_in_path = None
         elif self.sign_in_path is None:
-            self.sign_in_path = '/api/user/checkin' if self.template == 'newapi' else '/api/user/sign_in'
+            self.sign_in_path = ('/api/v1/user/check-in' if sub2api else
+                                 '/api/user/checkin' if self.template == 'newapi' else '/api/user/sign_in')
         return self
 
     def provider(self, provider_id, *, active=True):
         values = self.model_dump(exclude={'name'})
         return Provider(name=provider_id, display_name=self.name, custom=True, active=active,
-                        login_methods=BROWSER_METHODS + ('session',), **values)
+                        login_methods=BROWSER_METHODS + CREDENTIAL_METHODS, **values)
 
 
 PROVIDERS = {
@@ -130,6 +138,7 @@ def provider_catalog():
              'quota_per_unit': provider.quota_per_unit, 'login_path': provider.login_path,
              'sign_in_path': provider.sign_in_path, 'user_info_path': provider.user_info_path,
              'api_user_key': provider.api_user_key,
+             'login_api_path': provider.login_api_path,
              'login_methods': list(provider.login_methods),
              'oauth_availability': provider.oauth_availability}
             for key, provider in PROVIDERS.items()]

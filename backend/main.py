@@ -3,7 +3,6 @@ import asyncio
 import csv
 import io
 import secrets
-import httpx
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -20,6 +19,8 @@ from .providers import (PROVIDERS, BROWSER_METHODS, CREDENTIAL_METHODS, provider
                         supports, CustomProviderIn, load_custom_providers)
 from .paths import APP_NAME, APP_VERSION, resource_root
 from .proxy import ProxyConfig, normalize_proxy
+from .protocols import resolve_custom_protocol
+from .site_probe import probe_site
 
 ROOT = resource_root()
 CSRF = secrets.token_urlsafe(24)
@@ -33,7 +34,11 @@ async def reauthenticate_checkin(row, api_user):
     return await login_flow.authenticate_for_checkin(row, api_user)
 
 
-engine = CheckinEngine(reauthenticate=reauthenticate_checkin)
+async def resolve_provider(page, provider):
+    return await resolve_custom_protocol(page, provider, store)
+
+
+engine = CheckinEngine(reauthenticate=reauthenticate_checkin, resolve_provider=resolve_provider)
 queued = set()
 active = set()
 jobs = set()
@@ -48,7 +53,7 @@ class AccountIn(BaseModel):
     interval_hours: int = Field(default=6, ge=1, le=168)
     email: str | None = Field(default=None, max_length=200)
     password: str | None = Field(default=None, max_length=300)
-    session: str | None = Field(default=None, max_length=8000)
+    session: str | None = Field(default=None, max_length=32000)
     api_user: str | None = Field(default=None, max_length=100)
 
     @field_validator('name', 'email', 'session', 'api_user')
@@ -72,6 +77,15 @@ class AccountIn(BaseModel):
 class SettingsIn(BaseModel):
     scheduler_enabled: bool
     interval_hours: int = Field(ge=1, le=168)
+
+
+class ProviderProbeIn(BaseModel):
+    domain: str = Field(max_length=250)
+
+    @field_validator('domain')
+    @classmethod
+    def validate_domain(cls, value):
+        return CustomProviderIn.validate_domain(value)
 
 
 class LoginIn(BaseModel):
@@ -127,7 +141,7 @@ async def invalid_request(request, error):
     # FastAPI's default errors echo submitted inputs, including proxy passwords.
     if request.url.path.startswith('/api/providers'):
         labels = {'name': '站点名称', 'domain': 'HTTPS 根网址（不含账号、路径或参数）',
-                  'template': '签到模式', 'login_path': '登录页面路径', 'sign_in_path': '签到接口路径',
+                  'template': '签到模式', 'login_path': '登录页面路径', 'login_api_path': '账号密码登录接口路径', 'sign_in_path': '签到接口路径',
                   'user_info_path': '余额接口路径', 'api_user_key': '用户标识请求头（不能使用保留头）',
                   'quota_per_unit': '额度换算值', 'currency': '额度单位'}
         fields = list(dict.fromkeys(item['loc'][-1] for item in error.errors() if item['loc'][-1] in labels))
@@ -281,30 +295,19 @@ async def delete_provider(provider_id: str):
 
 
 @app.post('/api/providers/probe')
-async def probe_provider(data: CustomProviderIn):
+async def probe_provider(data: ProviderProbeIn, request: Request):
     """Read public capabilities without cookies, account credentials or a check-in POST."""
+    task = asyncio.create_task(probe_site(data.domain))
     try:
-        async with asyncio.timeout(12), httpx.AsyncClient(timeout=10, follow_redirects=False, trust_env=False) as client:
-            async with client.stream('GET', data.domain + '/api/status') as response:
-                if response.status_code != 200:
-                    return {'recognized': False, 'message': f'公开配置返回 HTTP {response.status_code}；可保存配置，兼容性待登录验证。'}
-                raw = bytearray()
-                async for chunk in response.aiter_bytes():
-                    raw.extend(chunk)
-                    if len(raw) > 262144:
-                        return {'recognized': False, 'message': '公开配置过大，无法识别。'}
-        import json
-        body = json.loads(raw)
-        config = body.get('data') if isinstance(body, dict) else None
-        if not isinstance(config, dict) or body.get('success') is not True or 'system_name' not in config:
-            raise ValueError('unrecognized')
-        enabled = config.get('checkin_enabled')
-        return {'recognized': True, 'checkin_enabled': enabled if isinstance(enabled, bool) else None,
-                'message': ('已识别 New API 公开配置，标准签到已开启；仍需登录后验证接口。' if enabled is True else
-                            '已识别公开配置，标准签到已关闭；可选择仅同步余额或核对自定义签到接口。' if enabled is False else
-                            '已识别公开配置，未声明标准签到能力；请核对签到路径。')}
-    except (httpx.HTTPError, ValueError, UnicodeError, TimeoutError):
-        return {'recognized': False, 'message': '未取得可识别的公开配置，请检查网址或网站防护；检测不影响手动保存。'}
+        while not task.done():
+            await asyncio.wait({task}, timeout=.25)
+            if not task.done() and await request.is_disconnected():
+                raise HTTPException(499, '检测已取消')
+        return await task
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @app.post('/api/login/start', status_code=202)
@@ -336,6 +339,13 @@ def login_status(session_id: str):
 async def resume_login(session_id: str):
     if not login_flow.resume_verification(session_id):
         raise HTTPException(409, '当前授权不在等待人工处理状态，请查询最新进度。')
+    return {'ok': True, **login_flow.view(session_id)}
+
+
+@app.post('/api/login/{session_id}/continue-oauth')
+async def continue_oauth(session_id: str):
+    if not login_flow.continue_oauth(session_id):
+        raise HTTPException(409, '当前授权不处于可继续状态，请等待页面更新或重新发起授权。')
     return {'ok': True, **login_flow.view(session_id)}
 
 

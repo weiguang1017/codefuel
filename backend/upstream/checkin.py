@@ -179,6 +179,8 @@ async def login_with_credentials(
 	page = None
 	try:
 		page = await context.new_page()
+		from ..agreements import setup_agreement_guard
+		await setup_agreement_guard(context, provider_config.domain)
 		await prepare_browser_page(page)
 		await navigate_login_page(
 			page,

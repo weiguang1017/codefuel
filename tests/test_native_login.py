@@ -13,7 +13,7 @@ import pytest
 from backend import native_login as native
 from backend.engine import LOCAL_CHROME
 from backend.login_flow import LoginFlow, LoginSession, ProfileVerificationBlocked
-from backend.providers import PROVIDERS
+from backend.providers import PROVIDERS, CustomProviderIn
 from test_app import db, FakeContext
 
 
@@ -126,15 +126,16 @@ async def test_browser_close_and_application_shutdown_cancel_without_saving(db, 
 
 
 @pytest.mark.asyncio
-async def test_only_explicit_agentrouter_linuxdo_uses_native_browser(db, monkeypatch):
+async def test_agentrouter_and_custom_linuxdo_use_native_browser(db, monkeypatch):
     flow = LoginFlow(db)
     controlled = AsyncMock()
     human = AsyncMock()
     monkeypatch.setattr(flow, '_run_window', controlled)
     monkeypatch.setattr(native, 'run_native_login', human)
-    for provider, method in [('agentrouter', 'linuxdo'), ('agentrouter', 'github'), ('anyrouter', 'linuxdo')]:
+    monkeypatch.setitem(PROVIDERS, 'custom', CustomProviderIn(name='fixture', domain='https://fixture.example').provider('custom'))
+    for provider, method in [('agentrouter', 'linuxdo'), ('agentrouter', 'github'), ('anyrouter', 'linuxdo'), ('custom', 'linuxdo')]:
         await flow._run(LoginSession(provider, method, 'fixture'))
-    assert human.await_count == 1 and controlled.await_count == 2
+    assert human.await_count == 2 and controlled.await_count == 2
 
 
 def test_proxy_arguments_never_expose_authentication():
@@ -182,6 +183,8 @@ async def test_real_native_chrome_keeps_native_identity_profile_and_selected_pro
                                             'domain': 'native-login.invalid', 'path': '/'}])
             assert chrome.process.returncode is None
             assert await chrome.tabs()
+            await chrome.open_target('http://native-login.invalid/continue', close_tabs=[tabs[0].id])
+            await eventually(lambda: any('/continue' in url for url in seen))
             async with chrome.attached() as (browser, context):
                 assert any(cookie['name'] == 'fixture' for cookie in await context.cookies())
         from pathlib import Path

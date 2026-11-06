@@ -250,12 +250,13 @@ def test_probe_only_reads_public_status(local, monkeypatch):
         requests.append(request)
         return httpx.Response(200, json={'success': True, 'data': {'system_name': 'test', 'checkin_enabled': False}})
     original = httpx.AsyncClient
-    monkeypatch.setattr(main.httpx, 'AsyncClient', lambda **kwargs: original(transport=httpx.MockTransport(handler), **kwargs))
-    response = client.post('/api/providers/probe', json={'name': 'test', 'domain': 'https://custom.example'})
+    from backend import site_probe
+    monkeypatch.setattr(site_probe.httpx, 'AsyncClient', lambda **kwargs: original(transport=httpx.MockTransport(handler), **kwargs))
+    response = client.post('/api/providers/probe', json={'domain': 'https://custom.example'})
     assert response.status_code == 200 and response.json()['checkin_enabled'] is False
-    assert len(requests) == 1 and requests[0].method == 'GET'
-    assert str(requests[0].url) == 'https://custom.example/api/status'
-    assert not requests[0].headers.get('cookie') and not requests[0].headers.get('authorization')
+    assert len(requests) == 2 and all(request.method == 'GET' for request in requests)
+    assert {str(request.url) for request in requests} == {'https://custom.example/api/status', 'https://custom.example/api/v1/settings/public'}
+    assert all(not request.headers.get('cookie') and not request.headers.get('authorization') for request in requests)
 
 
 @pytest.mark.asyncio

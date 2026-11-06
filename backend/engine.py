@@ -5,6 +5,7 @@ import asyncio
 import os
 import sys
 import time
+import math
 from pathlib import Path
 import httpx
 from playwright.async_api import Error as PlaywrightError
@@ -12,6 +13,8 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from .providers import PROVIDERS
 from .quota import quota_snapshot
+from .protocols import is_sub2api, response_data, profile_snapshot, ProtocolMismatch
+from .agreements import setup_agreement_guard, accept_site_agreements
 from .cookies import site_cookies
 from .retry import RETRY_DELAYS, transient_error, transient_status
 from .proxy import browser_proxy, proxy_failure_message
@@ -77,13 +80,14 @@ def classify_response(status_code, body):
 
 class BrowserSession:
     """Same-origin browser fetch; avoids TLS fingerprint rejection by the site WAF."""
-    def __init__(self, provider, cookies, site_cookie_cache=None, proxy=None):
+    def __init__(self, provider, cookies, site_cookie_cache=None, proxy=None, auth_token=None):
         self.provider = provider
         self.cookies = cookies
         self.site_cookie_cache = site_cookies(site_cookie_cache or [], provider)
         self.browser = None
         self.proxy = proxy
         self._last_request = 0.0
+        self.auth_token = auth_token
 
     async def __aenter__(self):
         from urllib.parse import urlparse
@@ -98,6 +102,7 @@ class BrowserSession:
         try:
             context = await self.browser.new_context(**({'proxy': self.proxy} if self.proxy is not None and not direct else {}))
             self.context = context
+            await setup_agreement_guard(context, self.provider.domain)
             if self.site_cookie_cache:
                 await context.add_cookies(self.site_cookie_cache)
             host = urlparse(self.provider.domain).hostname
@@ -168,11 +173,13 @@ class BrowserSession:
         except PlaywrightError:
             pass
 
-    async def request(self, path, api_user, method='GET', payload=None):
+    async def request(self, path, api_user, method='GET', payload=None, auth=True):
         script = '''async (o) => {
           const target = new URL(o.path, o.origin);
           if (location.origin !== o.origin || target.origin !== o.origin) throw new Error('Unexpected site origin');
-          const headers = {[o.userHeader]: o.user, 'X-Requested-With': 'XMLHttpRequest'};
+          const headers = {'X-Requested-With': 'XMLHttpRequest'};
+          if (o.bearer) { if(o.token) { headers['X-User-UI-Request'] = '1'; headers.Authorization = `Bearer ${o.token}`; } }
+          else if(o.user != null) headers[o.userHeader] = o.user;
           const options = {method: o.method, headers, credentials: 'same-origin', cache: 'no-store', redirect: 'error'};
           if (o.payload !== null) { headers['Content-Type'] = 'application/json'; options.body = JSON.stringify(o.payload); }
           const response = await fetch(target.href, options);
@@ -184,8 +191,9 @@ class BrowserSession:
           const guarded = /text\\/html/i.test(type) || /aliyun_waf|滑动验证|访问验证/.test(text.slice(0, 4000));
           return {status: response.status, body, guarded, bytes: text.length};
         }'''
-        args = {'path': path, 'user': str(api_user), 'method': method, 'payload': payload,
-                'userHeader': self.provider.api_user_key, 'origin': self.provider.domain}
+        args = {'path': path, 'user': str(api_user) if api_user is not None and auth else None, 'method': method, 'payload': payload,
+                'userHeader': self.provider.api_user_key, 'origin': self.provider.domain,
+                'bearer': is_sub2api(self.provider), 'token': self.auth_token if auth else None}
         for attempt in range(CONTEXT_RETRIES):
             # 间隔发送，避免短时间内连发接口被判定为自动化流量。
             gap = REQUEST_SPACING - (time.monotonic() - self._last_request)
@@ -210,8 +218,9 @@ class BrowserSession:
 
 
 class CheckinEngine:
-    def __init__(self, reauthenticate=None):
+    def __init__(self, reauthenticate=None, resolve_provider=None):
         self.reauthenticate = reauthenticate
+        self.resolve_provider = resolve_provider
 
     async def run(self, row, credentials, previous_snapshot=False):
         start = time.monotonic()
@@ -236,7 +245,10 @@ class CheckinEngine:
         may_retry = row['provider'] == 'agentrouter' and row['auth_mode'] == 'session'
         try:
             proxy = browser_proxy(credentials.get('proxy'))
-            if row['auth_mode'] == 'password':
+            custom_password = provider.custom and row['auth_mode'] == 'password'
+            if custom_password:
+                cookies, api_user = {}, None
+            elif row['auth_mode'] == 'password':
                 login = await login_with_credentials(row['name'], provider, row['provider'], credentials['email'], credentials['password'],
                                                       **({'proxy': proxy} if proxy is not None else {}))
                 if not login:
@@ -249,12 +261,46 @@ class CheckinEngine:
                     result.update(status='manual_required', message='登录后未获取到账号标识，请前往官网检查账号状态。')
                     return result
             else:
-                cookies, api_user = {'session': credentials['session']}, credentials['api_user']
+                cookies, api_user = ({} if is_sub2api(provider) else {'session': credentials['session']}), credentials['api_user']
             options = {'site_cookie_cache': credentials['site_cookies']} if credentials.get('site_cookies') else {}
             if proxy is not None:
                 options['proxy'] = proxy
+            if is_sub2api(provider) and not custom_password:
+                options['auth_token'] = credentials.get('session')
             async with BrowserSession(provider, cookies, **options) as client:
+                if custom_password:
+                    if self.resolve_provider:
+                        provider = await self.resolve_provider(client.page, provider)
+                        client.provider = provider
+                    await accept_site_agreements(getattr(client, 'page', None), provider.domain)
+                    identity_key = 'email' if is_sub2api(provider) else 'username'
+                    response = await client.request(provider.login_api_path, None, method='POST', auth=False,
+                                                    payload={identity_key: credentials['email'], 'password': credentials['password']})
+                    data = response_data(response.get('body'), provider) if response['status'] == 200 and not response.get('guarded') else None
+                    profile = data.get('user') if data and is_sub2api(provider) else data
+                    if not profile or not isinstance(profile, dict) or isinstance(profile.get('id'), bool) or not str(profile.get('id', '')).isdigit():
+                        return {**result, 'status': 'manual_required', 'message': '账号密码登录未通过；请核对账号信息，遇验证码或二次验证时改用浏览器手动登录。'}
+                    api_user = str(profile['id'])
+                    if int(api_user) <= 0:
+                        return {**result, 'status': 'failed', 'message': '登录响应未包含有效的账号身份。'}
+                    if is_sub2api(provider):
+                        token = data.get('access_token')
+                        if not isinstance(token, str) or not token or len(token) > 32000:
+                            return {**result, 'status': 'manual_required', 'message': '站点尚未签发有效登录 Token，请使用浏览器手动登录完成验证。'}
+                        client.auth_token = token
                 before = await self.user_info(client, provider, api_user)
+                if (is_sub2api(provider) and before.get('status') == 401 and credentials.get('refresh_token') and not custom_password):
+                    response = await client.request('/api/v1/auth/refresh', None, method='POST', auth=False,
+                                                    payload={'refresh_token': credentials['refresh_token']})
+                    data = response_data(response.get('body'), provider) if response['status'] == 200 else None
+                    if data and isinstance(data.get('access_token'), str) and 0 < len(data['access_token']) <= 32000:
+                        client.auth_token = data['access_token']
+                        before = await self.user_info(client, provider, api_user)
+                        if not before.get('error'):
+                            refresh = data.get('refresh_token', credentials['refresh_token'])
+                            if not isinstance(refresh, str) or not 0 < len(refresh) <= 32000:
+                                return {**result, 'status': 'manual_required', 'message': '站点刷新登录态的响应异常，请重新授权。'}
+                            result['_session_update'] = {'session': data['access_token'], 'refresh_token': refresh}
                 if before.get('waf'):
                     # 站点对自动化请求升级为滑块验证；重试不会更快通过，只会加深风控。
                     result.update(status='manual_required', message=(
@@ -278,7 +324,7 @@ class CheckinEngine:
                     return result
                 before_balance, before_total = before['balance'], before['total']
                 if row['auth_mode'] == 'session' and hasattr(client, 'export_site_cookies'):
-                    result['_session_update'] = {'site_cookies': await client.export_site_cookies()}
+                    result.setdefault('_session_update', {}).update(site_cookies=await client.export_site_cookies())
                 if provider.sign_in_path:
                     response = await client.request(provider.sign_in_path, api_user, method='POST', payload={})
                     status, message = classify_response(response['status'], response['body'])
@@ -288,7 +334,9 @@ class CheckinEngine:
                             status, message = 'manual_required', '站点要求人工验证，请在浏览器中处理后重试。'
                         elif status == 'success':
                             confirmed = body.get('success') is True
-                            if provider.template == 'sign_in' and 'success' not in body:
+                            if is_sub2api(provider):
+                                confirmed = type(body.get('code')) is int and body['code'] == 0
+                            elif provider.template == 'sign_in' and 'success' not in body:
                                 confirmed = ((type(body.get('ret')) is int and body['ret'] == 1)
                                              or (type(body.get('code')) is int and body['code'] == 0))
                             if not confirmed:
@@ -296,6 +344,16 @@ class CheckinEngine:
                         elif status == 'failed':
                             # Do not persist arbitrary responses that might echo credentials.
                             message = '签到未获确认，请检查签到路径、登录状态或站点兼容性。'
+                        if is_sub2api(provider) and isinstance(body, dict):
+                            reason = body.get('reason') or body.get('code')
+                            if reason == 'CHECK_IN_ALREADY_DONE':
+                                status, message = 'already_checked', '站点确认今日已签到。'
+                            elif reason in ('CHECK_IN_CAPTCHA_REQUIRED', 'CHECK_IN_DISABLED'):
+                                status, message = 'manual_required', '站点要求人工验证或尚未开放签到，请在官网处理。'
+                            reward_data = response_data(body, provider)
+                            reward = reward_data.get('reward') if reward_data else None
+                            if status == 'success' and isinstance(reward, (int, float)) and not isinstance(reward, bool) and math.isfinite(reward) and reward >= 0:
+                                result['reward'] = round(reward, 2)
                     # Preserve the explicit check-in acknowledgement even when
                     # the subsequent balance request times out.
                     result.update(status=status, message=message, before_balance=before_balance)
@@ -321,13 +379,15 @@ class CheckinEngine:
                     return result
                 result.update(after_balance=after['balance'], used_quota=after['used_quota'],
                               total_quota=after['total'])
-                if status == 'success':
+                if status == 'success' and before_total is not None and after['total'] is not None:
                     result['reward'] = max(0, round(after['total'] - before_total, 2))
                 elif status == 'already_checked':
                     result['reward'] = 0
                 if result['reward'] is not None and result['reward'] > 0:
                     unit = {'USD': '$', 'CNY': '¥', 'credits': '积分 '}.get(provider.currency, '')
                     result['message'] += f' 本次额度增加 {unit}{result["reward"]:.2f}。'
+        except ProtocolMismatch as exc:
+            result.update(status='manual_required', message=str(exc))
         except WAFCookiesUnavailable:
             result.update(status='manual_required', message=(
                 'AgentRouter 未能取得站点所需的防护 Cookie（acw_tc），本次未发送账号请求。'
@@ -415,10 +475,12 @@ class CheckinEngine:
                 hint = '请稍后重试。' if transient_status(response['status']) else '请检查登录状态或站点访问限制。'
                 return {'status': response['status'], 'error': f'无法读取账号信息（HTTP {response["status"]}），{hint}'}
             body = response['body']
-            if not isinstance(body, dict) or body.get('success') is not True or not isinstance(body.get('data'), dict):
+            data = response_data(body, provider)
+            if data is None:
                 return {'status': 200, 'error': '账号信息验证未通过，请检查凭据是否有效。'}
-            data = body['data']
-            snapshot = quota_snapshot(data, getattr(provider, 'quota_per_unit', 500000))
+            if is_sub2api(provider) and (isinstance(data.get('id'), bool) or not str(data.get('id', '')).isdigit() or int(data['id']) <= 0):
+                return {'error': '站点未返回有效的账号身份，未更新余额或凭据。'}
+            snapshot = profile_snapshot(data, provider)
             if snapshot is None:
                 return {'error': '账号余额字段缺失或格式异常，保留上次余额。'}
             if data.get('id') is not None and str(data['id']) != str(api_user):
