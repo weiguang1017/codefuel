@@ -116,3 +116,9 @@
 @media(max-width:480px){.site-section>.panel-head{align-items:flex-start;gap:12px;flex-wrap:wrap}.site-advanced .form-grid{grid-template-columns:1fr}.site-advanced summary span{display:block;margin:5px 0 0}.site-card{padding:17px}}
 @media(max-width:480px){.proxy-settings .form-grid{grid-template-columns:1fr;gap:0}}
 @media(max-width:480px){.platform-options{grid-template-columns:1fr}.platform-heading{align-items:flex-start}.platform-heading .panel-link{max-width:125px}.platform-progress li>div{flex-wrap:wrap}.referral-banner-links{flex-wrap:wrap}.heading-actions{flex-wrap:wrap}}
+
+/* 概览保留约五行高度，更多账号在卡片内滚动。 */
+.overview-accounts-scroll{max-height:366px;overflow-y:auto;border-radius:0 0 11px 11px;scrollbar-width:thin;scrollbar-color:#c2cec5 transparent}
+.overview-accounts-scroll .account-table{border-collapse:separate;border-spacing:0}
+.overview-accounts-scroll .account-table th{position:sticky;top:0;z-index:1;box-shadow:0 1px 0 var(--line)}
+.overview-accounts-scroll:focus-visible{outline:2px solid #91aa97;outline-offset:-2px}
