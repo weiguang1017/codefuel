@@ -4,14 +4,16 @@
 
 面向开发者的桌面签到与额度控制台，内置 **AnyRouter** 与 **AgentRouter**，支持用户添加兼容 New API、Sub2API 的自定义站点，集中展示额度、运行记录与调度状态。仅支持 macOS 与 Windows 桌面端。
 
-## 官方平台
+## 🎁 注册即多得 $50.00 额度
 
-| 平台 | 官方地址 |
+还没注册账号？通过下面的专属链接注册，**可额外获得 $50.00 奖励额度**：
+
+| 平台 | 专属注册链接 |
 |---|---|
-| **AgentRouter** | <https://agentrouter.org> |
-| **AnyRouter** | <https://anyrouter.top> |
+| **AgentRouter** | <https://agentrouter.org/register?aff=MBCp> |
+| **AnyRouter** | <https://anyrouter.top/register?aff=x73u> |
 
-注册并创建账号后，可添加到码粮进行每日签到与额度管理。
+注册后把账号加进码粮，每日签到即可持续累积额度。
 
 ## 特性
 

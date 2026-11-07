@@ -24,13 +24,12 @@
 .sidebar{overflow:hidden}.sidebar>*{flex-shrink:0}
 .sidebar>.sidebar-main{flex:1;min-height:0;overflow-y:auto;scrollbar-width:thin}
 .sidebar-bottom{margin-top:12px}
-/* 侧栏广告位：暂开放两个招商席位 */
+/* 侧栏广告位：两个平台的 Key 购买入口 */
 .ad-placements{display:grid;gap:8px;margin:18px 3px 20px}
 .ad-placements-heading{display:flex;align-items:center;justify-content:space-between;margin:0 1px 2px;font-size:10px;color:#857656;letter-spacing:.5px}.ad-placements-heading small{font-size:9px;color:#a59880;letter-spacing:0}
-.ad-slot{width:100%;min-height:58px;padding:10px 11px;display:flex;align-items:center;gap:10px;text-align:left;background:linear-gradient(120deg,#fdf9f1,#f7faf6);border:1px dashed #dccbab;border-radius:9px;color:#7a6742;transition:background .15s,border-color .15s,box-shadow .15s}
+.ad-slot{width:100%;min-height:58px;padding:10px;display:flex;align-items:center;gap:8px;text-align:left;background:linear-gradient(120deg,#fdf9f1,#f7faf6);border:1px dashed #dccbab;border-radius:9px;color:#7a6742;transition:background .15s,border-color .15s,box-shadow .15s}
 .ad-slot:hover{background:#fcf6e9;border-color:#b9985d;box-shadow:0 2px 8px #a7763610}.ad-slot:focus-visible{outline:2px solid #a77636;outline-offset:3px}
 .ad-slot-number{display:grid;place-items:center;width:26px;height:28px;flex:none;border-radius:6px;background:#f4ecd9;color:#a28753;font:11px ui-monospace,monospace}.ad-slot-copy{flex:1;min-width:0}.ad-slot-copy strong{display:block;font-size:11px;font-weight:550}.ad-slot-copy small{display:block;font-size:9px;color:#a39478;margin-top:2px}.ad-slot>svg{width:13px;height:13px;color:#aa9570}
-.ad-inquiry-intro{font-size:12px;line-height:1.85;color:#79877e;margin-bottom:20px}.ad-contact{padding:16px;background:#f8faf7;border:1px solid #e2e9e0;border-radius:9px;margin-bottom:20px}.ad-contact label{display:block;font-size:11px;color:#829087;margin-bottom:6px}.ad-contact input{width:100%;border:0;border-bottom:1px solid #dfe7dc;padding:4px 0 8px;background:transparent;color:#3c5947;font:15px ui-monospace,monospace;outline:none}.ad-contact input:focus{border-bottom-color:#648f70}.ad-contact p{font-size:10px;color:#8d998e;margin-top:10px}
 @media(prefers-reduced-motion:reduce){.ad-slot{transition:none}}
 @media(max-height:820px) and (min-width:761px){.sidebar .brand{margin-bottom:20px}.sidebar .nav-label.second{margin-top:18px}.sidebar .nav{gap:3px}.sidebar .nav-item{padding-top:8px;padding-bottom:8px}.sidebar .provider-links{gap:10px}.sidebar .ad-placements{margin-top:14px;margin-bottom:8px;gap:6px}.sidebar .ad-slot{min-height:50px;padding-top:7px;padding-bottom:7px}.sidebar .local-card{margin-top:12px;margin-bottom:10px;padding-top:10px;padding-bottom:10px}}
 /* 概览页推荐横幅 */

@@ -59,25 +59,6 @@ function accountsPanel(overview=false){
 }
 function recentRuns(limit=5){const runs=state.data.runs.slice(0,limit);return `<section class="panel"><div class="panel-head"><div class="panel-title">最近动态</div><button class="panel-link" data-view="logs">完整日志${icon('arrow')}</button></div>${runs.length?runs.map(r=>`<button class="recent-item" style="width:100%;background:none;border-left:0;border-right:0;border-bottom:0;text-align:left" data-action="log" data-id="${r.id}"><span class="provider-badge ${r.provider==='anyrouter'?'any':r.provider==='agentrouter'?'agent':'custom'}" style="width:27px;height:27px;font-size:14px">${esc((allProviders().find(p=>p.id===r.provider)?.name||r.provider).slice(0,1))}</span><div class="grow"><b style="font-weight:500;color:#64736a">${esc(r.account_name)}</b><small>${providerName(r.provider)} · ${r.trigger==='manual'?'手动执行':'定时执行'}</small></div>${statusBadge(r.status)}<time>${timeLabel(r.started_at)}</time>${icon('chevron')}</button>`).join(''):`<div class="empty-row"><div class="empty-state">${icon('list')}<b>还没有运行记录</b><p>每次执行都会留下可追溯的结果</p></div></div>`}</section>`;}
 function referralBanner(){return `<section class="referral-banner"><div class="referral-banner-icon">${icon('gift')}</div><div class="referral-banner-text"><b>还没账号？通过专属链接注册，额外多得 <em>$50.00</em> 奖励额度</b><p>注册后把账号加进码粮，每日签到持续累积额度</p></div><div class="referral-banner-links"><a class="referral-link" href="https://agentrouter.org/register?aff=MBCp" target="_blank" rel="noopener">注册 AgentRouter${icon('arrow')}</a><a class="referral-link" href="https://anyrouter.top/register?aff=x73u" target="_blank" rel="noopener">注册 AnyRouter${icon('arrow')}</a></div></section>`;}
-const AD_CONTACT_EMAIL = '77890866@qq.com';
-function adInquiry(slot){
-  if(!['1','2'].includes(String(slot)))return;
-  const number=String(slot).padStart(2,'0');
-  const subject=`码粮 CodeFuel 广告合作咨询 · 广告位 ${number}`;
-  const body=`你好，我想咨询码粮 CodeFuel 侧栏广告位 ${number}。\n\n产品 / 品牌名称：\n推广链接：\n期望合作周期：\n其他需求：`;
-  const href=`mailto:${AD_CONTACT_EMAIL}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
-  modal(`<div class="modal-head"><div><h2>广告位 ${number} · 合作咨询</h2><p>码粮 CodeFuel 侧栏广告位，现开放合作。</p></div><button class="icon-button" data-action="close" aria-label="关闭">${icon('x')}</button></div><p class="ad-inquiry-intro">欢迎 AI 服务、开发工具及相关产品合作。请在邮件中说明产品名称、推广链接与合作周期，我们会进一步沟通投放安排。</p><div class="ad-contact"><label for="ad-contact-email">商务合作邮箱</label><input id="ad-contact-email" value="${esc(AD_CONTACT_EMAIL)}" readonly spellcheck="false"><p>咨询时请注明「广告位 ${number}」，方便沟通投放位置。</p></div><div class="modal-actions"><button class="button secondary" data-action="copy-ad-email">复制邮箱</button><a class="button primary" href="${esc(href)}" target="_blank" rel="noopener">邮件咨询${icon('arrow')}</a></div>`);
-}
-async function copyAdEmail(){
-  try{await navigator.clipboard.writeText(AD_CONTACT_EMAIL);toast('合作邮箱已复制');}
-  catch{
-    const input=$('#ad-contact-email');if(!input)return;
-    input.focus();input.select();
-    let copied=false;
-    try{copied=document.execCommand('copy');}catch{}
-    toast(copied?'合作邮箱已复制':'邮箱已选中，请使用复制快捷键复制。');
-  }
-}
 function overview(){return `${referralBanner()}${currencyPicker()}${stats()}<div class="overview-grid">${chart()}${schedule()}</div>${accountsPanel(true)}<div class="recent-grid">${recentRuns()}</div>`;}
 function accountsView(){return `<div class="toolbar"><div class="search">${icon('search')}<input id="account-search" value="${esc(state.query)}" placeholder="搜索账号名称…" aria-label="搜索账号"></div><div class="filter-group">${[['all','全部平台'],...providers().map(p=>[p.id,p.name]),...Array.from(new Set(state.data.accounts.map(a=>a.provider))).filter(id=>!providers().some(p=>p.id===id)).map(id=>[id,id])].map(([v,t])=>`<button class="filter ${state.filter===v?'active':''}" data-filter="${esc(v)}">${esc(t)}</button>`).join('')}</div></div><div class="view-panel">${accountsPanel()}</div>`;}
 function logsView(){const runs=state.data.runs;return `<section class="panel"><div class="panel-head"><div><div class="panel-title">运行日志</div><div class="panel-sub">展示最近 100 条 · 原始凭据不会写入日志</div></div><button class="button secondary small" data-action="export">${icon('download')}导出 CSV</button></div><div class="table-wrap"><table class="account-table"><thead><tr><th>执行时间</th><th>账号 / 平台</th><th>触发方式</th><th>状态</th><th>额度变化</th><th>结果说明</th><th></th></tr></thead><tbody>${runs.length?runs.map(r=>`<tr><td style="white-space:nowrap">${timeLabel(r.started_at,true)}</td><td><div class="account-name">${esc(r.account_name)}<small>${providerName(r.provider)}</small></div></td><td>${r.trigger==='manual'?'手动':'定时'}</td><td>${statusBadge(r.status)}</td><td class="balance ${r.reward>0?'success-text':''}">${r.reward==null?'—':(r.reward>0?'+':'')+money(r.reward,r.currency)}</td><td class="log-message">${esc(r.message)}</td><td><button class="icon-button" data-action="log" data-id="${r.id}">${icon('chevron')}</button></td></tr>`).join(''):`<tr><td colspan="7" class="empty-row"><div class="empty-state">${icon('list')}<b>日志还是空的</b><p>点击「立即签到全部」或单账号的播放按钮开始</p></div></td></tr>`}</tbody></table></div></section>`;}
@@ -421,8 +402,6 @@ document.addEventListener('click',async e=>{const btn=e.target.closest('button')
  else if(btn.dataset.action==='connect-platform'){const a=state.data.accounts.find(x=>x.id===Number(btn.dataset.id));if(a&&isOAuth(a.login_via))accountModal(null,a);}
  else if(btn.dataset.action==='relogin'){const a=state.data.accounts.find(x=>x.id===Number(btn.dataset.id));if(!a)return;const method=isBrowser(a.login_via)?a.login_via:'manual';launchLogin({provider:a.provider,method,interval_hours:a.interval_hours,name:a.name,account_id:a.id});}
  else if(btn.dataset.action==='add')accountModal();
- else if(btn.dataset.action==='ad-inquiry')adInquiry(btn.dataset.slot);
- else if(btn.dataset.action==='copy-ad-email')await copyAdEmail();
  else if(btn.dataset.action==='close')closeModal();
  else if(btn.dataset.action==='settings')settingsModal();
  else if(btn.dataset.action==='edit')accountModal(state.data.accounts.find(a=>a.id===Number(btn.dataset.id)));
