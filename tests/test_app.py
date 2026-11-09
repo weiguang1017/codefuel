@@ -1,8 +1,9 @@
 import asyncio
 import json
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
+from zoneinfo import ZoneInfo
 import pytest
 from fastapi.testclient import TestClient
 from backend.store import Store, utcnow, iso
@@ -87,6 +88,31 @@ def account(**kw):
     return {'name': '主账号', 'provider': 'anyrouter', 'auth_mode': 'password',
             'email': 'test@example.com', 'password': 'correct-horse', 'enabled': True,
             'interval_hours': 6, **kw}
+
+
+def test_dashboard_groups_runs_by_local_calendar_day(db, monkeypatch):
+    import backend.store as store_module
+
+    zone = ZoneInfo('Asia/Shanghai')
+    monkeypatch.setattr(store_module, 'utcnow', lambda: datetime(2026, 11, 9, 12, tzinfo=timezone.utc))
+    monkeypatch.setattr(store_module, 'local_date',
+                        lambda value: datetime.fromisoformat(value).astimezone(zone).date())
+    rows = [
+        (1, '2026-11-08T15:59:00+00:00', 4.0),
+        (2, '2026-11-08T16:01:00+00:00', 25.0),
+        (2, '2026-11-09T02:00:00+00:00', 0.0),
+    ]
+    for account_id, started_at, reward in rows:
+        db.db.execute('INSERT INTO runs (account_id,account_name,provider,status,trigger_type,started_at,currency,reward) '
+                      'VALUES(?,?,?,?,?,?,?,?)', (account_id, 'fixture', 'anyrouter', 'success', 'scheduled',
+                                                   started_at, 'USD', reward))
+    db.db.commit()
+
+    dashboard = db.dashboard()
+    assert dashboard['stats']['today_reward'] == 25.0
+    assert dashboard['stats']['today_completed'] == 1
+    assert [(point['date'], point['reward']) for point in dashboard['trend'][-2:]] == [
+        ('11-08', 4.0), ('11-09', 25.0)]
 
 
 @pytest.mark.asyncio

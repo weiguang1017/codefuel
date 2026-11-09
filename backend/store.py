@@ -27,6 +27,11 @@ def iso(dt=None):
     return (dt or utcnow()).isoformat(timespec='seconds')
 
 
+def local_date(value):
+    """Return the machine-local calendar date for a stored timestamp."""
+    return datetime.fromisoformat(value).astimezone().date()
+
+
 def amount_group(row):
     return f'credits:{row["provider"]}' if row['currency'] == 'credits' else row['currency']
 
@@ -274,13 +279,14 @@ class Store:
         accounts = [self.public_account(r) for r in self.accounts()]
         runs = self.runs()
         known = [a['balance'] for a in accounts if a['balance'] is not None and a['currency'] == 'USD']
-        today = utcnow().date().isoformat()
-        today_runs = [r for r in runs if r['started_at'].startswith(today)]
+        today = utcnow().astimezone().date()
+        dated_runs = [(r, local_date(r['started_at'])) for r in runs]
+        today_runs = [r for r, day in dated_runs if day == today]
         trend = []
         for i in range(6, -1, -1):
-            day = (utcnow() - timedelta(days=i)).date().isoformat()
-            rs = [r for r in runs if r['started_at'].startswith(day)]
-            trend.append({'date': day[5:], 'reward': round(sum(r['reward'] or 0 for r in rs if r['currency'] == 'USD'), 2), 'runs': len(rs)})
+            day = today - timedelta(days=i)
+            rs = [r for r, run_day in dated_runs if run_day == day]
+            trend.append({'date': day.isoformat()[5:], 'reward': round(sum(r['reward'] or 0 for r in rs if r['currency'] == 'USD'), 2), 'runs': len(rs)})
         currencies = sorted({'USD'} | {amount_group(a) for a in accounts} | {amount_group(r) for r in runs})
         amounts = {}
         trends = {}
@@ -290,12 +296,14 @@ class Store:
                                  'today_reward': round(sum(r['reward'] or 0 for r in today_runs if amount_group(r) == currency), 2)}
             trends[currency] = []
             for i in range(6, -1, -1):
-                day = (utcnow() - timedelta(days=i)).date().isoformat()
-                rs = [r for r in runs if r['started_at'].startswith(day) and amount_group(r) == currency]
-                trends[currency].append({'date': day[5:], 'reward': round(sum(r['reward'] or 0 for r in rs), 2), 'runs': len(rs)})
+                day = today - timedelta(days=i)
+                rs = [r for r, run_day in dated_runs if run_day == day and amount_group(r) == currency]
+                trends[currency].append({'date': day.isoformat()[5:], 'reward': round(sum(r['reward'] or 0 for r in rs), 2), 'runs': len(rs)})
         return {'accounts': accounts, 'runs': runs, 'settings': self.settings(),
                 'amounts': amounts, 'trends': trends,
                 'stats': {'balance': round(sum(known), 2) if known else None,
                           'today_reward': amounts['USD']['today_reward'],
-                          'today_completed': len([r for r in today_runs if r['status'] in ('success', 'already_checked', 'synced')]),
+                          'today_completed': len({r['account_id'] for r in today_runs
+                                                  if r['account_id'] is not None and
+                                                  r['status'] in ('success', 'already_checked', 'synced')}),
                           'total_accounts': len(accounts)}, 'trend': trend}
