@@ -172,7 +172,8 @@ class Store:
             return cur.lastrowid
 
     def apply_login(self, account_id, session, api_user, login_via, balance=None, used_quota=None, *, provider,
-                    name=None, interval_hours=None, oauth_cookies=None, site_cookies=None, oauth_user_agent=None, proxy=None, refresh_token=None):
+                    name=None, interval_hours=None, oauth_cookies=None, site_cookies=None, oauth_user_agent=None, proxy=None, refresh_token=None,
+                    checked_in=None):
         """保存前再次核对平台、运行状态和已有站点身份。"""
         with self.lock:
             row = self.account(account_id)
@@ -201,8 +202,26 @@ class Store:
                 updates.update(interval_hours=interval_hours,
                                next_run=iso(utcnow() + timedelta(hours=interval_hours)))
             if balance is not None:
-                updates.update(balance=balance, used_quota=used_quota, has_snapshot=1,
-                               total_quota=round(balance + used_quota, 2) if used_quota is not None else None)
+                total = round(balance + used_quota, 2) if used_quota is not None else None
+                updates.update(balance=balance, used_quota=used_quota, has_snapshot=1, total_quota=total)
+                # 登录本身可能发放签到奖励；只按授权前后两次额度记录补计，不假定固定金额。
+                if total is not None and row['has_snapshot'] and row['total_quota'] is not None and total > row['total_quota']:
+                    increase = round(total - row['total_quota'], 2)
+                    meta = PROVIDERS.get(provider)
+                    currency = meta.currency if meta else 'USD'
+                    unit = {'USD': '$', 'CNY': '¥'}.get(currency, '')
+                    suffix = ' 积分' if currency == 'credits' else ''
+                    amount = lambda v: f'{unit}{v:.2f}{suffix}'
+                    confirmed = checked_in is True
+                    message = (f'重新授权时站点确认今日已签到，总额度由 {amount(row["total_quota"])} 增至 {amount(total)}，补计 {amount(increase)}。'
+                               if confirmed else
+                               f'重新授权前后总额度由 {amount(row["total_quota"])} 增至 {amount(total)}，按两次额度记录补计 {amount(increase)}。')
+                    now = iso()
+                    self.db.execute('INSERT INTO runs (account_id,account_name,provider,status,trigger_type,started_at,finished_at,'
+                                    'before_balance,after_balance,reward,message,duration_ms,currency) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                                    (account_id, updates.get('name', row['name']), provider, 'success' if confirmed else 'synced',
+                                     'reauth', now, now, row['balance'], balance, increase, message, 0, currency))
+                    updates['last_message'] = f'登录状态已更新，检测到额度增加 {amount(increase)}，已计入额度记录。'
             self.patch(account_id, **updates)
             return True
 
@@ -277,6 +296,7 @@ class Store:
 
     def dashboard(self):
         accounts = [self.public_account(r) for r in self.accounts()]
+        account_ids = {a['id'] for a in accounts}
         runs = self.runs()
         known = [a['balance'] for a in accounts if a['balance'] is not None and a['currency'] == 'USD']
         today = utcnow().astimezone().date()
@@ -304,6 +324,6 @@ class Store:
                 'stats': {'balance': round(sum(known), 2) if known else None,
                           'today_reward': amounts['USD']['today_reward'],
                           'today_completed': len({r['account_id'] for r in today_runs
-                                                  if r['account_id'] is not None and
+                                                  if r['account_id'] in account_ids and
                                                   r['status'] in ('success', 'already_checked', 'synced')}),
                           'total_accounts': len(accounts)}, 'trend': trend}

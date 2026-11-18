@@ -1256,6 +1256,7 @@ class LoginFlow:
                                                      oauth_cookies=getattr(session, 'oauth_cookies', []),
                                                      oauth_user_agent=getattr(session, 'oauth_user_agent', None),
                                                      proxy=getattr(session, 'account_proxy', None),
+                                                     checked_in=profile.get('checked_in'),
                                                      **({'refresh_token': getattr(session, 'refresh_token', None)} if is_sub2api(PROVIDERS[session.provider]) else {}))
                 except ValueError as error:
                     session.status, session.message = 'failed', str(error)

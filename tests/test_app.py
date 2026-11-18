@@ -97,6 +97,8 @@ def test_dashboard_groups_runs_by_local_calendar_day(db, monkeypatch):
     monkeypatch.setattr(store_module, 'utcnow', lambda: datetime(2026, 11, 9, 12, tzinfo=timezone.utc))
     monkeypatch.setattr(store_module, 'local_date',
                         lambda value: datetime.fromisoformat(value).astimezone(zone).date())
+    db.add_account(account())
+    db.add_account(account(name='二号账号'))
     rows = [
         (1, '2026-11-08T15:59:00+00:00', 4.0),
         (2, '2026-11-08T16:01:00+00:00', 25.0),
@@ -113,6 +115,97 @@ def test_dashboard_groups_runs_by_local_calendar_day(db, monkeypatch):
     assert dashboard['stats']['today_completed'] == 1
     assert [(point['date'], point['reward']) for point in dashboard['trend'][-2:]] == [
         ('11-08', 4.0), ('11-09', 25.0)]
+
+
+def test_today_completed_dedupes_accounts_and_ignores_deleted(db):
+    first = db.add_account(account())
+    second = db.add_account(account(name='二号账号'))
+    deleted = db.add_account(account(name='已删除账号'))
+    now = iso()
+    for account_id, status in [(first, 'success'), (first, 'success'), (second, 'already_checked'),
+                               (deleted, 'success'), (None, 'success'), (first, 'failed')]:
+        db.db.execute('INSERT INTO runs (account_id,account_name,provider,status,trigger_type,started_at,currency) '
+                      'VALUES(?,?,?,?,?,?,?)', (account_id, 'fixture', 'anyrouter', status, 'scheduled', now, 'USD'))
+    db.db.commit()
+    db.delete_account(deleted)
+
+    stats = db.dashboard()['stats']
+    assert stats['today_completed'] == 2
+    assert stats['total_accounts'] == 2
+
+
+def reauth_account(db, **kw):
+    account_id = db.add_account(account(provider='agentrouter', auth_mode='session',
+                                        email=None, password=None, session='old-cookie', api_user='7', **kw))
+    db.patch(account_id, balance=100.0, used_quota=5.0, total_quota=105.0, has_snapshot=1)
+    return account_id
+
+
+def test_apply_login_records_reward_granted_during_reauth(db):
+    account_id = reauth_account(db)
+
+    assert db.apply_login(account_id, 'new-cookie', '7', 'github', 125.0, 5.0,
+                          provider='agentrouter', checked_in=True)
+
+    run = db.runs()[0]
+    assert run['trigger'] == 'reauth'
+    assert run['status'] == 'success'
+    assert run['reward'] == 25.0
+    assert run['before_balance'] == 100.0
+    assert run['after_balance'] == 125.0
+    assert '补计 $25.00' in run['message']
+    stats = db.dashboard()['stats']
+    assert stats['today_reward'] == 25.0
+    assert stats['today_completed'] == 1
+    assert db.account(account_id)['total_quota'] == 130.0
+    # 额度持平的再次授权不重复记账。
+    assert db.apply_login(account_id, 'newer-cookie', '7', 'github', 125.0, 5.0,
+                          provider='agentrouter', checked_in=True)
+    assert len(db.runs()) == 1
+
+
+def test_apply_login_increase_without_checkin_flag_is_synced(db):
+    account_id = reauth_account(db)
+
+    assert db.apply_login(account_id, 'new-cookie', '7', 'github', 125.0, 5.0, provider='agentrouter')
+
+    run = db.runs()[0]
+    assert run['trigger'] == 'reauth'
+    assert run['status'] == 'synced'
+    assert run['reward'] == 25.0
+    assert '确认今日已签到' not in run['message']
+
+
+def test_apply_login_without_prior_snapshot_records_nothing(db):
+    account_id = db.add_account(account(provider='agentrouter', auth_mode='session',
+                                        email=None, password=None, session='old-cookie', api_user='7'))
+
+    assert db.apply_login(account_id, 'new-cookie', '7', 'github', 125.0, 5.0,
+                          provider='agentrouter', checked_in=True)
+
+    assert db.runs() == []
+    assert db.account(account_id)['total_quota'] == 130.0
+
+
+@pytest.mark.parametrize('has_snapshot', [0, 1])
+@pytest.mark.asyncio
+async def test_relogin_without_live_before_keeps_reward_unverified(db, engine_responses, has_snapshot):
+    from backend.engine import CheckinEngine
+    account_id = db.add_account(account(provider='agentrouter', auth_mode='session', email=None, password=None,
+                                        session='old', api_user='7',
+                                        oauth_cookies=[{'name': 'saved', 'value': '1', 'domain': '.github.com'}]))
+    if has_snapshot:
+        db.patch(account_id, balance=100.0, used_quota=5.0, total_quota=105.0, has_snapshot=1)
+    engine_responses([{'status': 401, 'body': {'success': False}}])
+    relogin = AsyncMock(return_value={'profile': {'id': 7, 'quota': 65000000, 'used_quota': 2500000, 'checked_in': True},
+                                      'session': 'fresh', 'site_cookies': [], 'oauth_cookies': []})
+
+    row = db.account(account_id)
+    result = await CheckinEngine(relogin).run(row, db.credentials(row))
+
+    assert result['status'] == 'success'
+    assert result['reward'] is None
+    assert '奖励金额暂未确认' in result['message']
 
 
 @pytest.mark.asyncio

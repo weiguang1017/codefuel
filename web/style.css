@@ -121,3 +121,7 @@
 .overview-accounts-scroll .account-table{border-collapse:separate;border-spacing:0}
 .overview-accounts-scroll .account-table th{position:sticky;top:0;z-index:1;box-shadow:0 1px 0 var(--line)}
 .overview-accounts-scroll:focus-visible{outline:2px solid #91aa97;outline-offset:-2px}
+button.status-badge{border:0;font-family:inherit;line-height:inherit}
+.status-badge.status-link{cursor:pointer;text-decoration:underline dotted;text-underline-offset:3px;transition:background .15s,box-shadow .15s}
+.status-badge.status-link:hover{background:#f7e2dd;box-shadow:0 0 0 3px rgba(180,119,103,.14)}
+.status-badge.status-link:focus-visible{outline:2px solid #b47767;outline-offset:2px}
