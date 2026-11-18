@@ -17,8 +17,8 @@ const authLabel = a => (a.auth_mode === 'password' ? '账号密码'
   : a.login_via === 'linuxdo' ? 'LinuxDO 授权'
   : a.login_via === 'manual' ? '浏览器登录'
   : 'Session') + `<small class="account-proxy">${a.proxy?.mode==='custom'?'自定义代理':a.proxy?.mode==='direct'?'直连':'默认网络'}</small>`;
-const state = {data:null, currency:'USD', view:'overview', filter:'all', query:'', editing:null, busy:false, loginMethod:'github', loginSession:null, reauth:false, connecting:null, targetProvider:null, selectedProviders:[], loginQueue:null};
-let toastTimer, loginPoll;
+const state = {data:null, currency:'USD', view:'overview', filter:'all', query:'', editing:null, busy:false, loginMethod:'github', loginSession:null, reauth:false, connecting:null, targetProvider:null, selectedProviders:[], loginQueue:null, update:null, updateDismissed:null, updating:false};
+let toastTimer, loginPoll, updatePoll, updateChecked=false;
 function toast(message){ const el=$('#toast'); el.textContent=message; el.classList.add('show'); clearTimeout(toastTimer); toastTimer=setTimeout(()=>el.classList.remove('show'),3300); }
 async function api(path, options={}) {
   const method=options.method || 'GET';
@@ -27,7 +27,7 @@ async function api(path, options={}) {
   return response.json();
 }
 async function refresh(silent=false){
-  try{const res=await fetch('/api/bootstrap'); if(!res.ok)throw new Error(); state.data=await res.json(); render(); if(!silent){} }
+  try{const res=await fetch('/api/bootstrap'); if(!res.ok)throw new Error(); state.data=await res.json(); render(); if(!updateChecked){updateChecked=true;checkUpdate();} }
   catch{if(!silent)toast('无法连接本地服务，请确认启动窗口仍在运行。')}
 }
 function timeLabel(value, date=false){
@@ -76,7 +76,7 @@ function render(){
     if(accountScroll.focused&&currentAccounts.hasAttribute('tabindex'))currentAccounts.focus({preventScroll:true});
   }
 }
-function modal(content){$('#modal-content').innerHTML=content;$('#modal').showModal();}
+function modal(content){$('#modal-content').innerHTML=content;$('#modal-content').dataset.kind='';$('#modal').showModal();}
 function showRunDetail(r){modal(`<div class="modal-head"><div><h2>${esc(r.account_name)}</h2><p>${providerName(r.provider)} · ${timeLabel(r.started_at,true)}</p></div><button class="icon-button" data-action="close">${icon('x')}</button></div><div class="log-detail">status: ${labels[r.status]||r.status}<br>trigger: ${r.trigger}<br>before: ${money(r.before_balance,r.currency)}<br>after: ${money(r.after_balance,r.currency)}<br>observed_change: ${r.reward==null?'unverified':money(r.reward,r.currency)}<br>duration: ${r.duration_ms||0} ms<br><br>${esc(r.message)}</div><div class="modal-actions"><button class="button primary" data-action="close">知道了</button></div>`);}
 function showAccountStatus(account){
   const run=state.data.runs.find(r=>r.account_id===account.id);
@@ -240,6 +240,48 @@ function syncCredentialLabels(){
   if(session&&!state.editing)session.placeholder=sub2api?'本站 localStorage 中 auth_token 的值':'仅填写当前平台 session 的值';
 }
 function settingsModal(){const s=state.data.settings;modal(`<div class="modal-head"><div><h2>定时设置</h2><p>任务由本地后台执行，关闭此页面不会中断。</p></div><button class="icon-button" data-action="close">${icon('x')}</button></div><form id="settings-form"><div class="settings-line"><div><b>启用自动签到</b><p>仅为已启用的账号安排定时任务</p></div><button type="button" class="switch ${s.scheduler_enabled?'on':''}" data-action="modal-switch"></button></div><div class="settings-line"><div><b>统一执行间隔</b><p>保存后将应用到所有账号</p></div><select name="interval_hours">${[3,6,12,24].map(h=>`<option value="${h}" ${s.interval_hours===h?'selected':''}>每 ${h} 小时</option>`).join('')}</select></div><input type="hidden" name="scheduler_enabled" value="${s.scheduler_enabled}"><div class="notice" style="margin-top:20px">${icon('info')}电脑关机、休眠或退出后台后无法执行；恢复运行时会补做一次到期任务。站点可能尚未到领取时间，此时会记录为「已签到」。</div><div class="modal-actions"><button type="button" class="button secondary" data-action="close">取消</button><button class="button primary" type="submit">保存设置</button></div></form>`);}
+async function checkUpdate(manual=false){
+  try{
+    const res=await fetch('/api/update/check');
+    if(!res.ok){let msg='检查更新失败，请稍后重试';try{msg=(await res.json()).detail||msg;}catch{}if(manual)toast(msg);return;}
+    const info=await res.json();state.update=info;
+    const badge=$('#update-badge');
+    if(info.has_update){
+      badge.hidden=false;badge.textContent=`新版本 v${info.latest}`;
+      if(manual||state.updateDismissed!==info.latest)showUpdateModal();
+    }else{
+      badge.hidden=true;
+      if(manual)toast(`已是最新版本 v${info.current}`);
+    }
+  }catch{if(manual)toast('无法连接本地服务，检查更新未完成');}
+}
+function showUpdateModal(){
+  const u=state.update;if(!u||!u.has_update)return;
+  modal(`<div class="modal-head"><div><h2>发现新版本 v${esc(u.latest)}</h2><p>当前版本 v${esc(u.current)}${u.installable?'，可自动下载安装，完成后自动重启。':'，请前往发布页下载安装。'}</p></div><button class="icon-button" data-action="dismiss-update" aria-label="关闭">${icon('x')}</button></div>
+  ${u.notes?`<div class="log-detail update-notes">${esc(u.notes)}</div>`:''}
+  <div class="notice">${icon('info')}${u.installable?'更新会替换本机应用并自动重启；账号数据保存在独立的数据目录，不受影响。':'自动更新仅支持 macOS 安装版，其他环境请到发布页手动下载安装。'}</div>
+  <div class="modal-actions"><button class="button secondary" data-action="dismiss-update">稍后</button>${u.installable?`<button class="button primary" data-action="start-update">${icon('download')}立即更新</button>`:`<a class="button primary" href="${esc(u.release_url)}" target="_blank" rel="noopener">前往下载</a>`}</div>`);
+  $('#modal-content').dataset.kind='update';
+}
+function renderUpdateProgress(p){
+  const mb=n=>(n/1048576).toFixed(1);
+  const body=p.phase==='downloading'?`<div class="update-progress"><div class="update-progress-bar" style="width:${p.percent||0}%"></div></div><p class="field-help">正在下载 v${esc(p.version||'')}… ${p.percent||0}%${p.total?` · ${mb(p.received)} / ${mb(p.total)} MB`:''}</p>`
+    :p.phase==='installing'?`<p class="field-help update-installing"><i class="inline-spinner"></i>${esc(p.message||'正在安装新版本…')}</p>`
+    :p.phase==='restarting'?`<p class="field-help">${esc(p.message||'安装完成，应用即将重启。')}</p>`
+    :`<div class="notice">${icon('info')}${esc(p.message||'更新未完成，请稍后重试。')}</div>`;
+  modal(`<div class="modal-head"><div><h2>正在更新</h2><p>${p.phase==='error'?'本次更新未成功，可重试或稍后再试。':'更新期间请勿关闭应用。'}</p></div></div>${body}${p.phase==='error'?`<div class="modal-actions"><button class="button secondary" data-action="close">关闭</button><button class="button primary" data-action="start-update">重试</button></div>`:''}`);
+  $('#modal-content').dataset.kind='update';
+}
+async function pollUpdate(){
+  if(!state.updating)return;
+  try{
+    const p=await api('/api/update/progress');
+    if($('#modal').open&&$('#modal-content').dataset.kind==='update')renderUpdateProgress(p);
+    if(p.phase==='error'){state.updating=false;toast(p.message||'更新未完成');return;}
+    if(p.phase==='restarting'){state.updating=false;return;}
+  }catch{}
+  updatePoll=setTimeout(pollUpdate,700);
+}
 function validateAccountForm(form,focus=true){
   form.dataset.validationAttempted='true';
   $$('.field-error',form).forEach(el=>el.remove());
@@ -408,6 +450,8 @@ document.addEventListener('click',async e=>{const btn=e.target.closest('button')
  else if(btn.dataset.action==='retry-poll'){const q=state.loginQueue;if(queueActive(q)&&q.items[q.index].status==='network')void pollLogin(q);}
  else if(btn.dataset.action==='connect-platform'){const a=state.data.accounts.find(x=>x.id===Number(btn.dataset.id));if(a&&isOAuth(a.login_via))accountModal(null,a);}
  else if(btn.dataset.action==='relogin'){const a=state.data.accounts.find(x=>x.id===Number(btn.dataset.id));if(!a)return;const method=isBrowser(a.login_via)?a.login_via:'manual';launchLogin({provider:a.provider,method,interval_hours:a.interval_hours,name:a.name,account_id:a.id});}
+ else if(btn.dataset.action==='dismiss-update'){state.updateDismissed=state.update?.latest;closeModal();}
+ else if(btn.dataset.action==='start-update'){btn.disabled=true;await api('/api/update/install',{method:'POST',body:{}});state.updating=true;clearTimeout(updatePoll);renderUpdateProgress({phase:'downloading',percent:0,received:0,total:state.update?.asset?.size||0,version:state.update?.latest});void pollUpdate();}
  else if(btn.dataset.action==='add')accountModal();
  else if(btn.dataset.action==='close')closeModal();
  else if(btn.dataset.action==='settings')settingsModal();
@@ -438,5 +482,8 @@ for(const event of ['input','change'])document.addEventListener(event,e=>{
 $('#modal').addEventListener('click',e=>{if(e.target===$('#modal'))closeModal();});
 $('#modal').addEventListener('cancel',e=>{e.preventDefault();closeModal();});
 window.__dqEnabledAccounts=()=>state.data?state.data.accounts.filter(a=>a.enabled).length:0;
+$('#update-badge').addEventListener('click',()=>{if(state.updating)return;state.update?.has_update?showUpdateModal():checkUpdate(true);});
+$('#app-version').addEventListener('click',()=>{if(!state.updating)checkUpdate(true);});
+setInterval(()=>{if(!state.updating)checkUpdate();},24*3600*1000);
 async function refreshLoop(silent=true){await refresh(silent);setTimeout(refreshLoop,5000);}
 refreshLoop(false);

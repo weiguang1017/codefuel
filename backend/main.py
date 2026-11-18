@@ -21,6 +21,7 @@ from .paths import APP_NAME, APP_VERSION, resource_root
 from .proxy import ProxyConfig, normalize_proxy
 from .protocols import resolve_custom_protocol
 from .site_probe import probe_site
+from . import updater
 
 ROOT = resource_root()
 CSRF = secrets.token_urlsafe(24)
@@ -124,6 +125,7 @@ async def lifespan(app):
     for job in pending_jobs:
         job.cancel()
     try:
+        await updater.shutdown()
         await login_flow.close()
     finally:
         try:
@@ -358,6 +360,27 @@ async def cancel_login(session_id: str):
 @app.get('/api/health')
 def health():
     return {'status': 'ok'}
+
+
+@app.get('/api/update/check')
+async def update_check():
+    try:
+        return await updater.fetch_latest()
+    except updater.UpdateError as error:
+        raise HTTPException(502, str(error))
+
+
+@app.post('/api/update/install', status_code=202)
+async def update_install():
+    try:
+        return await updater.start_install()
+    except updater.UpdateError as error:
+        raise HTTPException(409, str(error))
+
+
+@app.get('/api/update/progress')
+def update_progress():
+    return updater.progress()
 
 
 @app.post('/api/accounts', status_code=201)

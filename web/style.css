@@ -125,3 +125,10 @@ button.status-badge{border:0;font-family:inherit;line-height:inherit}
 .status-badge.status-link{cursor:pointer;text-decoration:underline dotted;text-underline-offset:3px;transition:background .15s,box-shadow .15s}
 .status-badge.status-link:hover{background:#f7e2dd;box-shadow:0 0 0 3px rgba(180,119,103,.14)}
 .status-badge.status-link:focus-visible{outline:2px solid #b47767;outline-offset:2px}
+.update-badge{border:0;background:#eaf1eb;color:#315e49;font-size:9px;font-weight:600;padding:2px 7px;border-radius:99px;white-space:nowrap;transition:.15s}
+.update-badge:hover{background:#dceadf}
+.version code{cursor:pointer}
+.update-notes{max-height:220px;overflow-y:auto;white-space:pre-wrap;font-family:inherit;font-size:11px}
+.update-progress{height:8px;background:#e8eee9;border-radius:99px;overflow:hidden;margin:6px 0 12px}
+.update-progress-bar{height:100%;background:#668d72;border-radius:99px;transition:width .4s}
+.update-installing{display:flex;align-items:center;gap:8px}
